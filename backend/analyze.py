@@ -960,6 +960,19 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
     # loop is not evidence at any model size.
     rescue_info = None
     if not results:
+        # Cheapest first: chunked, script-bridged alignment on the
+        # PRIMARY transcript's own segments (no new transcription).
+        # When the primary model already heard the clip well, this
+        # alone can rescue it; when it heard garbage, it simply
+        # finds nothing and the escalation below still runs.
+        if segs_o and not _pass_is_weak(text_o):
+            got = _rescue_alignment(segs_o, pairs, clip_dur)
+            if got:
+                _r, verdict, rescue_info = got
+                results = [_r]
+                diag["rescue"] = rescue_info
+                diag["rescue_stage"] = "primary_segments"
+    if not results:
         efn = escalate_fn
         if efn is None and transcribe_fn is None:
             def efn(p, task="transcribe"):
@@ -970,8 +983,14 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
             try:
                 esc_segs, _el, _ep = efn(upload_path,
                                          task="transcribe")
-            except Exception:
+            except Exception as _e:
+                # NEVER swallow this silently again: on the live
+                # app the escalation failed invisibly and the user
+                # saw a bare "no match" with no trace of the rescue
+                # (2026-10-21). The diagnostics must say why.
                 esc_segs = []
+                diag["rescue_error"] = \
+                    f"{type(_e).__name__}: {_e}"[:300]
             if esc_segs:
                 esc_text = " ".join(t for _, _, t in esc_segs)
                 _div = _diversity(esc_text)
@@ -982,6 +1001,7 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
                         _r, verdict, rescue_info = got
                         results = [_r]
                         diag["rescue"] = rescue_info
+                        diag["rescue_stage"] = "escalated"
 
     if not results:  # semantic fallback with the clip's own words
         for q in (text_en, text_o):
