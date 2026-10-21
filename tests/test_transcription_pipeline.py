@@ -223,7 +223,7 @@ def test_silence_hallucination_is_not_a_transcript(monkeypatch):
         def __init__(self, segs):
             self._segs = segs
 
-        def transcribe(self, path, beam_size=5):
+        def transcribe(self, path, beam_size=5, **kw):
             info = SimpleNamespace(language="en",
                                    language_probability=0.36)
             return iter(self._segs), info

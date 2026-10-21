@@ -66,9 +66,27 @@ def transcribe_clip(path: Path):
     model = _whisper()
     # pass raw audio array: avoids faster-whisper's PyAV decode path
     # (incompatible with av>=15 which dropped the metadata_errors kwarg)
-    segments, _ = model.transcribe(audio, beam_size=5)
+    segments, _ = model.transcribe(audio, beam_size=5, **_DECODE_KW)
     out = [(s.start, s.end, s.text.strip()) for s in segments if s.text.strip()]
     return " ".join(t for _, _, t in out), out
+
+
+# Deterministic decoding for EVERY transcription in this app.
+# Measured 2026-10-21: faster-whisper's DEFAULT decoding uses
+# temperature-fallback SAMPLING - when a segment trips the
+# logprob/compression thresholds (common on noisy fan-edit clips
+# with background music), it re-decodes at rising temperatures and
+# the SAME clip produced wildly different transcripts run to run
+# (clean English one run, repetition-loop gibberish the next), so a
+# clip from the selected drama intermittently returned "No verified
+# match". temperature=0.0 disables fallback sampling and
+# condition_on_previous_text=False stops repetition loops from
+# snowballing: with both pinned, the ground-truth clip produced the
+# IDENTICAL transcript and verdict (probable, score 0.313) on 3/3
+# runs, and a full episode indexed by the tiny model matched at
+# 0.557. This changes no evidence threshold - it stops the input
+# evidence itself from randomly degrading.
+_DECODE_KW = dict(temperature=0.0, condition_on_previous_text=False)
 
 
 def transcribe_audio_file(path: Path):
@@ -88,7 +106,7 @@ def transcribe_audio_file_meta(path: Path):
     they do not silently trust or silently discard the transcript."""
     model = _whisper()
     try:
-        segments, info = model.transcribe(str(path), beam_size=5)
+        segments, info = model.transcribe(str(path), beam_size=5, **_DECODE_KW)
     except TypeError:
         import av
         _orig = av.open
@@ -98,7 +116,7 @@ def transcribe_audio_file_meta(path: Path):
             return _orig(*a, **k)
         av.open = _patched
         try:
-            segments, info = model.transcribe(str(path), beam_size=5)
+            segments, info = model.transcribe(str(path), beam_size=5, **_DECODE_KW)
         finally:
             av.open = _orig
     rows = [(round(s.start, 1), round(s.end, 1), s.text.strip(),
@@ -181,7 +199,7 @@ def _whisper_transcribe(path, task="transcribe"):
     same speech in English."""
     model = _whisper()
     try:
-        segments, info = model.transcribe(str(path), beam_size=5, task=task)
+        segments, info = model.transcribe(str(path), beam_size=5, task=task, **_DECODE_KW)
     except TypeError:
         import av
         _orig = av.open
@@ -192,7 +210,7 @@ def _whisper_transcribe(path, task="transcribe"):
         av.open = _patched
         try:
             segments, info = model.transcribe(str(path), beam_size=5,
-                                              task=task)
+                                              task=task, **_DECODE_KW)
         finally:
             av.open = _orig
     segs = [(round(s.start, 1), round(s.end, 1), s.text.strip())
@@ -262,6 +280,32 @@ def _visual_compare(clip_hashes, frames_result):
             "detail": f"Qareeb tareen frame distance {best}/64 "
                       "(storyboard previews sparse hote hain — ye "
                       "sirf supporting signal hai, saboot nahi)."}
+
+
+def _diversity(text):
+    """Unique-token ratio of a transcript. Real dialogue - even a
+    short scene - is lexically diverse (>= ~0.3). A Whisper
+    repetition-loop hallucination ("you are the one who is the one
+    who is...") collapses to a handful of unique tokens no matter
+    how long it runs. Returns None for texts too short to judge."""
+    toks = text.split()
+    if len(toks) < 20:
+        return None
+    return round(len(set(toks)) / len(toks), 3)
+
+
+def _probe_duration(path):
+    """Container duration in seconds via PyAV, or None. Used only
+    for diagnostics - a transcript-derived duration (last segment
+    end) is the fallback when the probe fails."""
+    try:
+        import av
+        with av.open(str(path)) as c:
+            if c.duration:
+                return round(c.duration / 1_000_000, 1)
+    except Exception:
+        pass
+    return None
 
 
 def _visual_verify(upload_path, youtube_id, start, end):
@@ -527,7 +571,11 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
         segs_o, lang, prob = tf(upload_path, task="transcribe")
     except Exception as e:
         return {"ok": False,
-                "error": f"Could not transcribe the clip: {e}"}
+                "error": f"Could not transcribe the clip: {e}",
+                "failure_kind": "clip_unreadable",
+                "diagnostics": {
+                    "clip_read": False,
+                    "audio_extraction": f"failed: {type(e).__name__}"}}
     text_o = " ".join(t for _, _, t in segs_o)
     text_en, segs_en = "", []
     if lang and lang != "en" and text_o.strip():
@@ -537,14 +585,61 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
         except Exception:
             segs_en, text_en = [], ""
     coverage = search_mod.playlist_coverage(pid)
-    if not text_o.strip() and not text_en.strip():
-        return _visual_only_scan(pid, upload_path, lang, prob, coverage)
-
     pairs = []
     for v in db.get_videos(pid):
         segs = db.get_segments(v["id"])
         if segs:
             pairs.append((v, segs))
+    diag = {
+        "clip_read": True,
+        "clip_duration_s": None,  # filled in below
+        "audio_extraction": "ok" if (segs_o or segs_en) else
+                            "no_speech_detected",
+        "language": lang, "language_probability": prob,
+        "transcript_words_original": len(text_o.split()),
+        "transcript_words_english": len(text_en.split()),
+        "playlist_videos_total": coverage.get("total"),
+        "episodes_with_transcripts": coverage.get("searchable"),
+        "episodes_searched": len(pairs),
+        "segments_searched": sum(len(s) for _v, s in pairs),
+        "best_alignment": None,
+    }
+    if not text_o.strip() and not text_en.strip():
+        diag["clip_duration_s"] = _probe_duration(upload_path)
+        out = _visual_only_scan(pid, upload_path, lang, prob, coverage)
+        out["failure_kind"] = "no_speech"
+        out["diagnostics"] = diag
+        return out
+    # Degenerate-transcript gate: a repetition-loop hallucination
+    # is not evidence. Measured 2026-10-21: an unrelated drama's
+    # music/wailing clip transcribed to hundreds of looped words
+    # ("you are the one who is the one who..."), alignment found
+    # nothing, but the semantic fallback promoted the generic loop
+    # text to a PROBABLE match in the wrong drama (score 0.74).
+    # When BOTH passes are loops, the clip simply was not heard -
+    # report exactly that instead of matching the noise.
+    div_o, div_en = _diversity(text_o), _diversity(text_en)
+    diag["diversity_original"] = div_o
+    diag["diversity_english"] = div_en
+    if (div_o is not None and div_o < 0.15
+            and (div_en is None or div_en < 0.15)):
+        diag["clip_duration_s"] = _probe_duration(upload_path)
+        diag["verdict"] = "not_verified"
+        diag["failure_kind"] = "transcript_degenerate"
+        return {"ok": True, "language": lang,
+                "language_probability": prob,
+                "clip_transcript": text_o,
+                "clip_transcript_en": text_en or None,
+                "results": [], "coverage": coverage,
+                "verdict": "not_verified",
+                "failure_kind": "transcript_degenerate",
+                "diagnostics": diag,
+                "method": "clip transcription (degenerate - "
+                          "repetition loop)",
+                "note": "Clip ki transcription kharab ho gayi "
+                        "(Whisper ne aik hi jumla loop mein suna) — "
+                        "is text se koi episode verify nahi ho "
+                        "sakta."}
     cand = {}
 
     def _add(score, video, a, method):
@@ -564,6 +659,14 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
     for segs in (segs_o, segs_en):
         if segs:
             clip_dur = max(clip_dur, segs[-1][1])
+    diag["clip_duration_s"] = _probe_duration(upload_path) or \
+        round(clip_dur, 1)
+    if ranked:
+        _b = ranked[0]
+        diag["best_alignment"] = {
+            "score": round(_b["score"], 3),
+            "matched_words": _b["a"]["matched_words"],
+            "episode_title": _b["video"]["title"]}
     # Evidence gating: an alignment below the probable floor is
     # merely similar, not a match - it is suppressed entirely and
     # the verdict becomes "not verified" instead of dressing the
@@ -575,6 +678,36 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
         verdict = _alignment_verdict(kept[0]["score"],
                                      kept[0]["a"]["matched_words"])
     results = [_clip_result(c, clip_dur) for c in kept[:3]]
+
+    # Combined evidence (dialogue + visual TOGETHER): a dialogue
+    # alignment that is real but BELOW the probable floor can still
+    # be a genuine match when the clip's own frames independently
+    # match that scene's frames. Neither signal alone is promoted -
+    # dialogue must be weak-positive (>= 0.15 with >= 5 matched
+    # words) AND the frame comparison must come back "similar".
+    # The result is capped at probable and says exactly why.
+    if not results and ranked and visual_check:
+        c0 = ranked[0]
+        if c0["score"] >= 0.15 and c0["a"]["matched_words"] >= 5:
+            s0 = float(c0["a"]["offset"])
+            vis = _visual_verify(upload_path,
+                                 c0["video"]["youtube_id"],
+                                 s0, s0 + max(2.0, clip_dur))
+            if vis.get("status") == "similar":
+                r = _clip_result(c0, clip_dur)
+                r["visual"] = vis
+                r["method"] = (c0["method"] +
+                               " + visual frame match "
+                               "(combined evidence)")
+                r["reasons"].append(
+                    "Dialogue saboot akela probable ki hadd se "
+                    "neeche tha, lekin clip ke frames is scene ke "
+                    "frames se mazbooti se milte hain (visual "
+                    f"distance {vis.get('best_distance')}/64) — "
+                    "dono saboot mila kar ye probable hai, "
+                    "verified NAHI.")
+                results = [r]
+                verdict = "probable"
 
     if not results:  # semantic fallback with the clip's own words
         for q in (text_en, text_o):
@@ -592,6 +725,30 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
                 # promoted; anything less stays "no verified match".
                 if (r.get("score") or 0) < 0.5:
                     continue
+                # Distinctive-evidence requirement (measured false
+                # positives, 2026-10-21): a high score alone is NOT
+                # enough for a clip. Two unrelated-drama clips were
+                # promoted to probable purely on generic dramatic
+                # vocabulary - the search layer's own report showed
+                # only 5/19 and 7/16 of the clips' distinctive
+                # terms present in the "matched" scenes. A real
+                # match must contain a substantial share of the
+                # clip's OWN identifying terms in its dialogue.
+                _dist = search_mod.distinctive_terms(q)
+                if not _dist:
+                    diag.setdefault("semantic_rejected", []).append(
+                        {"title": r.get("title"),
+                         "reason": "clip has no distinctive terms"})
+                    continue
+                _covf, _hits = search_mod.coverage_factor(
+                    _dist, search_mod._scene_text(r["video_id"],
+                                                  r["timestamp"]))
+                if _hits < 4 or _hits / len(_dist) < 0.5:
+                    diag.setdefault("semantic_rejected", []).append(
+                        {"title": r.get("title"),
+                         "distinctive_hits": _hits,
+                         "distinctive_total": len(_dist)})
+                    continue
                 r = dict(r)
                 r["method"] = "semantic search (clip transcript)"
                 r.setdefault("visual", {
@@ -605,23 +762,46 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
                 verdict = "probable"
                 break
 
-    if results and kept and visual_check:
+    _top_real_visual = bool(results) and \
+        results[0].get("visual", {}).get("status") in ("similar",
+                                                       "different")
+    if results and visual_check and (kept or _top_real_visual):
         top = results[0]
-        top["visual"] = _visual_verify(upload_path,
-                                       top["youtube_id"],
-                                       top["scene_start"],
-                                       top["scene_end"])
+        if top.get("visual", {}).get("status") in (None, "not_checked"):
+            top["visual"] = _visual_verify(upload_path,
+                                           top["youtube_id"],
+                                           top["scene_start"],
+                                           top["scene_end"])
         # Frame-check the SCENE range's boundaries themselves
         # (episode-internal cuts - a different question from the
         # clip-vs-episode frame similarity above).
-        top["boundary"] = verify_boundaries(top["youtube_id"],
-                                            top["scene_start"],
-                                            top["scene_end"])
+        if "boundary" not in top:
+            top["boundary"] = verify_boundaries(top["youtube_id"],
+                                                top["scene_start"],
+                                                top["scene_end"])
+    # WHY nothing matched matters as much as THAT nothing matched:
+    # "no data existed to search" and "searched, evidence did not
+    # match" are different failures with different remedies, and the
+    # UI reports them differently. best_alignment in diagnostics
+    # shows the strongest raw evidence even when it was suppressed.
+    if results:
+        failure_kind = "ok"
+    elif not pairs:
+        failure_kind = "no_searchable_episodes"
+    elif max(diag["transcript_words_original"],
+             diag["transcript_words_english"]) < 5:
+        failure_kind = "transcript_too_short"
+    else:
+        failure_kind = "searched_no_match"
+    diag["verdict"] = verdict or "not_verified"
+    diag["failure_kind"] = failure_kind
     return {"ok": True, "language": lang, "language_probability": prob,
             "clip_transcript": text_o,
             "clip_transcript_en": text_en or None,
             "results": results, "coverage": coverage,
             "verdict": verdict or "not_verified",
+            "failure_kind": failure_kind,
+            "diagnostics": diag,
             "method": "clip transcription (original + translate) + "
                       "dialogue alignment",
             "note": None if results else
