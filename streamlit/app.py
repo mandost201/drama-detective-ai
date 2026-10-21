@@ -499,10 +499,19 @@ if _missing:
         st.success(f"🎙️ Transcription mukammal: "
                    f"{_rep.get('done', 0)} episode(s) ke transcripts "
                    "index ho gaye — wo ab searchable hain.")
+        for _lc in _rep.get("low_confidence", []):
+            st.warning(f"⚠️ {_lc.get('title')}: transcript index ho "
+                       f"gaya lekin Whisper ka zuban par aitmaad kam "
+                       f"tha ({_lc.get('probability')}) — dialogue "
+                       "ghalat ho sakta hai; zaroorat ho to behtar "
+                       "model se dobara transcribe karein.")
         for _f in _rep.get("failed", []):
             st.error(f"❌ {_f.get('title')}: {_f.get('error')}")
     elif _tx_job and _tx_job.get("status") == "error":
         st.error(f"🎙️ Transcription ruk gayi: {_tx_job.get('error')}")
+    _cur_model = os.environ.get("WHISPER_MODEL", "tiny")
+    _model_sizes = {"tiny": "~75MB", "base": "~140MB",
+                    "small": "~460MB", "medium": "~1.5GB"}
     st.caption(
         "⏱️ Resource note: Whisper is app ke free server par chalta "
         "hai — koi API key ya paisa nahi chahiye, lekin slow hai: aik "
@@ -510,7 +519,12 @@ if _missing:
         "hai, aur app ka awake rehna zaroori hai. Is liye pehle wohi "
         "episodes transcribe karein jin ki sab se zyada zaroorat hai; "
         "baqi baad mein. Subtitle file wala tareeqa sab se tez hai "
-        "agar aap ke paas .srt/.vtt maujood ho.")
+        "agar aap ke paas .srt/.vtt maujood ho. "
+        f"Maujooda Whisper model: **{_cur_model}** "
+        f"(size {_model_sizes.get(_cur_model, '?')}, pehli dafa "
+        "download hota hai). Har transcript ke saath us ki zuban, "
+        "model aur aitmaad mehfooz hota hai — tafseel neeche "
+        "'Transcripts ki tafseel' mein hai.")
     if st.button(f"🎙️ Sab {len(_missing)} missing episodes transcribe "
                  "karein (background job)",
                  key="tx_all_btn", disabled=_tx_running):
@@ -564,6 +578,58 @@ if _missing:
                         st.info("Frames available nahi: "
                                 + str(_ef.get("reason")))
             st.divider()
+
+# ---- transcript provenance: where every transcript came from ----
+# Nothing about a transcript is taken on faith: each searchable
+# episode lists its source, its caption/detected language, the
+# speech model that made it and (for Whisper) the detector's
+# confidence. Transcripts made by a different Whisper model than
+# the current one are flagged as stale and can be refreshed - the
+# replacement only lands if the new transcription succeeds.
+_searchable = [v for v in vids if v.get("has_transcript")]
+if _searchable:
+    _cur_model_ui = os.environ.get("WHISPER_MODEL", "tiny")
+    _src_label = {"captions": "YouTube captions", "whisper": "Whisper",
+                  "subtitle": "aap ki di hui subtitle file",
+                  "seed": "verified seed transcript", "upload": "upload"}
+    _stale_ids = [v["id"] for v in _searchable
+                  if v.get("transcript_source") == "whisper"
+                  and v.get("transcript_model")
+                  and v["transcript_model"] != _cur_model_ui]
+    with st.expander(f"📜 Transcripts ki tafseel — har episode ka "
+                     f"transcript kahan se aaya ({len(_searchable)})"):
+        for v in _searchable:
+            _src = _src_label.get(v.get("transcript_source") or
+                                  "captions",
+                                  v.get("transcript_source") or "?")
+            _bits = [f"**Episode {v['position']}** — {_src}"]
+            if v.get("transcript_model"):
+                _bits.append(f"model: {v['transcript_model']}")
+            _bits.append("zuban: "
+                         + (v.get("transcript_lang") or "maloom nahi"))
+            _p = v.get("transcript_prob")
+            if _p is not None:
+                _bits.append(f"zuban ka aitmaad: {_p:.0%}"
+                             + (" ⚠️ kam" if _p < 0.5 else ""))
+            st.markdown(" • ".join(_bits))
+        if _stale_ids:
+            st.warning(f"🎙️ {len(_stale_ids)} episode(s) purane "
+                       f"Whisper model se transcribed hain — "
+                       f"maujooda model **{_cur_model_ui}** hai. "
+                       "Dobara transcription sirf kamyabi par purani "
+                       "transcript badalti hai; nakami par purani "
+                       "mehfooz rehti hai.")
+            _txj2 = db.get_job(st.session_state.tx_jid) \
+                if st.session_state.get("tx_jid") else None
+            if st.button("🎙️ Purane model walay episodes dobara "
+                         "transcribe karein",
+                         key="tx_stale_btn",
+                         disabled=bool(_txj2 and _txj2.get("status")
+                                       == "running")):
+                st.session_state.tx_jid = \
+                    ingest.start_transcription_job(
+                        pid, video_ids=set(_stale_ids))
+                st.rerun()
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
