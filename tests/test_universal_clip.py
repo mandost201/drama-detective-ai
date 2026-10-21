@@ -85,6 +85,10 @@ def test_urdu_clip_matches_english_captions_via_translate(built_db,
     assert abs(top["timestamp"] - 828) <= 25, top["timestamp_hms"]
     assert "translated" in top["method"]
     assert top["visual"]["status"] == "unavailable"
+    # a clean, extensive dialogue match is the only thing that may
+    # be called VERIFIED
+    assert res["verdict"] == "verified"
+    assert top["verdict"] == "verified"
     cov = res["coverage"]
     assert cov["searchable"] == 3 and cov["total"] == 3
 
@@ -98,6 +102,7 @@ def test_unrelated_clip_says_no_verified_match(built_db):
         transcribe_fn=_stub_tf(gibberish, lang="en"))
     assert res["ok"] is True
     assert res["results"] == []
+    assert res["verdict"] == "not_verified"
     assert res["note"] == "No verified match in this playlist."
 
 
@@ -147,6 +152,7 @@ def test_silent_clip_visual_scan_labels_hints(built_db, monkeypatch,
     res = analyze.analyze_clip_full(pid, Path("silent.mp4"),
                                     transcribe_fn=silent)
     assert res["ok"] is True
+    assert res["verdict"] == "not_verified"  # hints never verify
     assert res["results"], "identical frames should yield a hint"
     top = res["results"][0]
     assert top["confidence"] == "low"
