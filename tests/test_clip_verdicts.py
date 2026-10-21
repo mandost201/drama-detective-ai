@@ -48,6 +48,12 @@ def _no_visual(monkeypatch):
                         lambda *a, **k: {"status": "unavailable",
                                          "best_distance": None,
                                          "detail": "test stub"})
+    monkeypatch.setattr(analyze, "verify_boundaries",
+                        lambda *a, **k: {"kind": "transcript_estimate",
+                                         "status": "unavailable",
+                                         "start_cut": None,
+                                         "end_cut": None,
+                                         "detail": "test stub"})
 
 
 def test_verdict_tiers_are_evidence_bound():
