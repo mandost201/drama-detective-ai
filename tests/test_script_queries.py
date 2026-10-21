@@ -36,3 +36,30 @@ def test_latin_query_path_unchanged(built_db):
     res = search.search(built_db["raja"], "Rania Mirza")
     assert res["results"][0]["episode"] == 25
     assert "effective_query" not in res  # no retry happened
+
+
+def test_urdu_query_with_semantic_enabled_still_uses_transliteration(
+        built_db, monkeypatch):
+    """Production repro (found live, 2026-10-21): with semantic
+    search ENABLED, the Urdu name query returns a weak semantic
+    hit (no distinctive-term coverage) instead of nothing - the
+    transliteration retry must fire on that evidence, not only
+    on an empty page, and must surface the real dialogue match."""
+    import numpy as np
+
+    from backend import embeddings
+    monkeypatch.setattr(embeddings, "available", lambda: True)
+
+    def fake_embed(texts):
+        # every text maps to the same unit vector: semantic search
+        # then returns hits for any query, as it did live
+        return np.tile(np.array([1.0, 0.0, 0.0, 0.0]),
+                       (len(texts), 1)).astype("float32")
+
+    monkeypatch.setattr(embeddings, "embed", fake_embed)
+    res = search.search(built_db["raja"], "رانیہ مرزا")
+    assert res["results"], res
+    top = res["results"][0]
+    assert top["episode"] == 25
+    assert top["matched_at"] == 865.0  # the real Rania Mirza line
+    assert res.get("effective_query")  # transliteration was used

@@ -337,19 +337,50 @@ def search(pid, query, mode="auto", top_k=8):
     """Combined search. Returns dict with results, alternatives,
     method info.
 
-    A query written in Urdu or Devanagari script whose own tokens
-    match nothing (names have no concept-map entries) is retried
-    with its Latin transliterations - the first candidate that
-    produces results wins, and the result records which query
+    Script queries (Urdu / Devanagari) get a transliteration
+    safety net. The naive trigger - retry only when the direct
+    search returns NOTHING - was wrong in production: with
+    semantic search enabled, a script query returns a weak
+    semantic hit whose scene contains none of the user's
+    distinctive terms, and the retry never fired (verified live,
+    2026-10-21: the Urdu name query showed a low-confidence
+    semantic result from the wrong scene). The correct trigger is
+    evidence: if the direct top result has no distinctive-term
+    coverage (cov_factor at the 0.36 floor), the Latin candidates
+    are tried and the candidate whose top result has the STRONGEST
+    coverage wins - not merely the first with any, because a
+    partial candidate ("rania mrza") can land on a scene that only
+    mentions half the name while the full candidate ("rania
+    mirza") finds the real line. The result records which query
     actually ran ("effective_query") so nothing is hidden."""
     res = _search_impl(pid, query, mode=mode, top_k=top_k)
-    if res["results"]:
+    cands = normalize.latin_candidates(query)
+    if not cands:
         return res
-    for cand in normalize.latin_candidates(query):
+
+    def _top_cov(r):
+        if not r["results"]:
+            return 0.0
+        return r["results"][0].get("cov_factor", 1.0)
+
+    if res["results"] and _top_cov(res) > 0.36:
+        return res  # the script query itself genuinely matched
+    best_alt, best_cov = None, _top_cov(res)
+    for cand in cands:
         alt = _search_impl(pid, cand, mode=mode, top_k=top_k)
-        if alt["results"]:
+        if alt["results"] and _top_cov(alt) > best_cov:
+            best_alt, best_cov = alt, _top_cov(alt)
             alt["effective_query"] = cand
-            return alt
+    if best_alt:
+        return best_alt
+    if not res["results"]:
+        # nothing with real coverage anywhere: still surface a
+        # candidate's weak results rather than an empty page
+        for cand in cands:
+            alt = _search_impl(pid, cand, mode=mode, top_k=top_k)
+            if alt["results"]:
+                alt["effective_query"] = cand
+                return alt
     return res
 
 
