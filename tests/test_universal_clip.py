@@ -196,6 +196,43 @@ def test_playlist_stats_counts_sources(tmp_path):
         db.DB_PATH = old
 
 
+# ------------------------------------------------------- ingest labels
+
+def test_ingest_marks_caption_source_not_whisper(tmp_path, monkeypatch):
+    """Regression: the captions path in run_playlist_job once got
+    labelled source='whisper' by a bulk edit, which made the stats
+    line claim captioned episodes were 'transcribed'."""
+    from backend import ingest
+    old = db.DB_PATH
+    db.DB_PATH = tmp_path / "ing.db"
+    db.init_db()
+    try:
+        pid = db.create_playlist("https://youtube.com/playlist?list=ING",
+                                 title="Ingest")
+        jid = db.create_job("playlist", pid)
+        monkeypatch.setattr(
+            ingest, "fetch_playlist",
+            lambda url: ("Ingest", [{
+                "youtube_id": "ING00000001", "title": "Ep 1",
+                "position": 1, "duration": None,
+                "url": "https://www.youtube.com/watch?v=ING00000001",
+                "thumbnail": None}]))
+        monkeypatch.setattr(
+            ingest, "fetch_transcript",
+            lambda yid: [(0.0, 2.0, "Caption line one."),
+                         (2.0, 4.0, "Caption line two.")])
+        ingest.run_playlist_job(jid, pid,
+                                "https://youtube.com/playlist?list=ING")
+        v = db.get_videos(pid)[0]
+        assert v["has_transcript"]
+        assert v["transcript_source"] == "captions"
+        st = db.playlist_stats(pid)
+        assert st["by_source"] == {"captions": 1}
+        assert st["transcribed"] == 0
+    finally:
+        db.DB_PATH = old
+
+
 # ------------------------------------------------------------- app UI
 
 def test_app_clip_section_renders(tmp_path):
