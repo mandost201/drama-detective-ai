@@ -197,13 +197,22 @@ def _pick_track(files, video_id):
 
 def fetch_transcript(video_id: str):
     """Return list of (start,end,text) or None if unavailable/restricted."""
-    segs = _transcript_ytdlp(video_id)
+    segs, _lang = fetch_transcript_meta(video_id)
+    return segs
+
+
+def fetch_transcript_meta(video_id: str):
+    """(segments, caption_language) or (None, None). The language
+    is the actual track that was used (e.g. 'en', 'ur', 'hi', or a
+    probed other language) - provenance the caller records with the
+    transcript. The API fallback cannot report a language."""
+    segs, lang = _transcript_ytdlp_meta(video_id)
     if segs:
-        return segs
+        return segs, lang
     try:
-        return _transcript_api(video_id)
+        return _transcript_api(video_id), None
     except Exception:
-        return None
+        return None, None
 
 
 def _download_subs(video_id, sub_langs, tmp, timeout=180):
@@ -231,16 +240,22 @@ def _download_subs(video_id, sub_langs, tmp, timeout=180):
 
 
 def _transcript_ytdlp(video_id: str):
+    segs, _lang = _transcript_ytdlp_meta(video_id)
+    return segs
+
+
+def _transcript_ytdlp_meta(video_id: str):
     """yt-dlp subtitle download with one retry: YouTube answers
     bursts of subtitle requests with HTTP 429 (transient), and a
-    single retry after a pause rescues otherwise-good episodes."""
+    single retry after a pause rescues otherwise-good episodes.
+    Returns (segments, track_language) or (None, None)."""
     for attempt in range(2):
-        segs = _transcript_ytdlp_once(video_id)
+        segs, lang = _transcript_ytdlp_once(video_id)
         if segs:
-            return segs
+            return segs, lang
         if attempt == 0:
             time.sleep(20)
-    return None
+    return None, None
 
 
 _OTHER_LANG_ROW = re.compile(r"^([a-zA-Z][a-zA-Z-]{1,14})\s{2,}\S")
@@ -283,7 +298,7 @@ def _transcript_ytdlp_once(video_id: str):
             except Exception:
                 segs = None
             if segs:
-                return segs
+                return segs, _track_lang(best.name, video_id)
         # Pass 2: ONE other language, chosen from the track list -
         # any transcript beats no transcript, without a request storm.
         lang = _probe_other_language(video_id)
@@ -297,10 +312,10 @@ def _transcript_ytdlp_once(video_id: str):
                 except Exception:
                     segs = None
                 if segs:
-                    return segs
-        return None
+                    return segs, _track_lang(best.name, video_id)
+        return None, None
     except Exception:
-        return None
+        return None, None
     finally:
         for f in tmp.glob("*"):
             try:

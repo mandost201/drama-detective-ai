@@ -75,9 +75,20 @@ def transcribe_audio_file(path: Path):
     """Transcribe an audio/video file directly. Returns list of
     (start, end, text). Works around the faster-whisper/PyAV
     metadata_errors incompatibility on old installs."""
+    segs, _lang, _prob = transcribe_audio_file_meta(path)
+    return segs
+
+
+def transcribe_audio_file_meta(path: Path):
+    """(segments, detected_language, language_probability) for an
+    audio/video file. faster-whisper's detection info is exactly
+    the provenance a transcript cache must keep: which language the
+    speech was heard as, and how confident the detector was. A low
+    probability is data, not an error - callers record it and warn,
+    they do not silently trust or silently discard the transcript."""
     model = _whisper()
     try:
-        segments, _ = model.transcribe(str(path), beam_size=5)
+        segments, info = model.transcribe(str(path), beam_size=5)
     except TypeError:
         import av
         _orig = av.open
@@ -87,11 +98,25 @@ def transcribe_audio_file(path: Path):
             return _orig(*a, **k)
         av.open = _patched
         try:
-            segments, _ = model.transcribe(str(path), beam_size=5)
+            segments, info = model.transcribe(str(path), beam_size=5)
         finally:
             av.open = _orig
-    return [(round(s.start, 1), round(s.end, 1), s.text.strip())
+    rows = [(round(s.start, 1), round(s.end, 1), s.text.strip(),
+             getattr(s, "no_speech_prob", 0.0))
             for s in segments if s.text.strip()]
+    segs = [(a, b, t) for a, b, t, _p in rows]
+    if rows and all(p > 0.6 for _a, _b, _t, p in rows):
+        # faster-whisper hallucinates on silence/near-silence (a
+        # lone "You" at no_speech_prob 0.68 on a pure-silence file,
+        # measured 2026-10-21). When EVERY segment is more likely
+        # no-speech than speech - 0.6 is Whisper's own
+        # no_speech_threshold - the honest result is "no speech",
+        # and the caller's empty-transcript path reports exactly
+        # that instead of indexing an invented line as a transcript.
+        return [], getattr(info, "language", None), \
+            getattr(info, "language_probability", None)
+    return segs, getattr(info, "language", None), \
+        getattr(info, "language_probability", None)
 
 
 def analyze_clip(pid, upload_path: Path):

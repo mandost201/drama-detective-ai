@@ -12,7 +12,8 @@ from . import db
 from . import embeddings
 from . import search as search_mod
 from .config import MAX_VIDEOS_PER_PLAYLIST, REQUEST_DELAY, TRANSCRIPT_WORKERS
-from .youtube import fetch_playlist, fetch_transcript
+from .config import WHISPER_MODEL
+from .youtube import fetch_playlist, fetch_transcript, fetch_transcript_meta
 
 
 def _seeded_youtube_ids():
@@ -44,10 +45,22 @@ def transcribe_missing_episodes(pid, progress_fn=None, video_ids=None):
     Only videos the app could legitimately access are processed (the
     same public audio download used everywhere else - no DRM or
     access-control bypass). A video is marked searchable ONLY after
-    its transcript segments are actually indexed. Returns a report
-    dict (see last_transcription_report); per-episode failures are
-    recorded in the report, never silently swallowed. Safe to call
-    anytime; skips videos already transcribed or covered by seeds."""
+    its transcript segments are actually indexed. Every successful
+    transcription records its provenance (detected language,
+    language probability, Whisper model name/version) with the
+    transcript; a detection probability under 0.5 is indexed but
+    flagged in the report's "low_confidence" list - a shaky
+    transcript is labelled, never silently trusted. Returns a
+    report dict (see last_transcription_report); per-episode
+    failures are recorded in the report, never silently swallowed.
+
+    Re-transcription: when video_ids names episodes explicitly,
+    already-transcribed episodes are included (this is how a
+    transcript made by an older/smaller model gets refreshed). The
+    replacement is safe: the new transcript is computed FIRST and
+    db.add_segments swaps old segments for new ones in one step -
+    if transcription fails, the previous transcript stays indexed
+    and searchable, untouched."""
     from pathlib import Path as _P
     from . import analyze as _analyze
     from .youtube import download_audio as _dl_audio
@@ -56,15 +69,18 @@ def transcribe_missing_episodes(pid, progress_fn=None, video_ids=None):
         if progress_fn:
             progress_fn(stage, cur, tot)
 
-    missing = [v for v in db.get_videos(pid) if not v["has_transcript"]]
     if video_ids is not None:
         wanted = set(video_ids)
-        missing = [v for v in missing if v["id"] in wanted]
+        missing = [v for v in db.get_videos(pid) if v["id"] in wanted]
+    else:
+        missing = [v for v in db.get_videos(pid)
+                   if not v["has_transcript"]]
     seeded_ids = _seeded_youtube_ids()
     skipped = [v for v in missing if v["youtube_id"] in seeded_ids]
     missing = [v for v in missing if v["youtube_id"] not in seeded_ids]
     report = {"requested": len(missing) + len(skipped), "done": 0,
-              "failed": [], "skipped_seeded": len(skipped)}
+              "failed": [], "low_confidence": [],
+              "skipped_seeded": len(skipped)}
     if not missing:
         _tx_reports[pid] = report
         return report
@@ -76,12 +92,22 @@ def transcribe_missing_episodes(pid, progress_fn=None, video_ids=None):
             mp3 = tmpdir / f"{yid}.mp3"
             try:
                 _dl_audio(yid, mp3)
-                segs = _analyze.transcribe_audio_file(mp3)
+                segs, det_lang, det_prob = \
+                    _analyze.transcribe_audio_file_meta(mp3)
                 if segs:
                     db.add_segments(v["id"], segs)
-                    db.mark_transcript(v["id"], True, source="whisper")
+                    db.mark_transcript(v["id"], True, source="whisper",
+                                       lang=det_lang,
+                                       model=WHISPER_MODEL,
+                                       prob=det_prob)
                     report["done"] += 1
-                    print(f"[ingest] whisper ok: {yid} ({len(segs)} segs)")
+                    if det_prob is not None and det_prob < 0.5:
+                        report["low_confidence"].append({
+                            "title": v["title"], "youtube_id": yid,
+                            "language": det_lang,
+                            "probability": round(det_prob, 2)})
+                    print(f"[ingest] whisper ok: {yid} ({len(segs)} segs, "
+                          f"lang={det_lang}, p={det_prob})")
                 else:
                     report["failed"].append({
                         "title": v["title"], "youtube_id": yid,
@@ -198,10 +224,11 @@ def run_playlist_job(jid: str, pid: str, url: str):
 
         def one(v):
             try:
-                segs = fetch_transcript(v["youtube_id"])
+                segs, cap_lang = fetch_transcript_meta(v["youtube_id"])
                 if segs:
                     db.add_segments(v["id"], segs)
-                    db.mark_transcript(v["id"], True, source="captions")
+                    db.mark_transcript(v["id"], True, source="captions",
+                                       lang=cap_lang)
                 else:
                     db.mark_transcript(v["id"], False)
             except Exception as e:

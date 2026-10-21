@@ -47,6 +47,8 @@ Upload a short clip of a scene — from a drama of any country or language — a
 3. **Your own subtitle file.** Upload a `.srt`/`.vtt` for a specific episode; its cues are parsed, indexed and embedded immediately.
 4. **Visual fallback.** For episodes with no transcript at all, the panel can show real storyboard frames from across the episode so a scene can be spotted by eye and its approximate time noted. (Frames are evidence for the user; the app does not claim to recognize their content.)
 
+**Transcript provenance & safe refresh.** Every transcript is stored with its provenance: source, the caption-track language or Whisper's detected language, the speech model name/version that produced it, the detection probability, and when it was made — all visible in the "📜 Transcripts ki tafseel" panel. Transcripts are cached per stable video ID; one made by an older Whisper model is flagged as stale and can be re-transcribed, and the swap is safe: the new transcript is computed first and replaces the old one only on success, so a failed refresh leaves the previous transcript searchable. A detection probability under 0.5 is indexed but flagged as low-confidence. And Whisper's silence hallucination is gated out: when every segment is more likely no-speech than speech (Whisper's own `no_speech_prob` > 0.6 — e.g. an invented "You" on a silent file), the episode is honestly reported as "no dialogue found", never indexed as a recovered transcript.
+
 ## Exact Clip Finder (upgraded search results)
 
 Every Step-2 result now also carries:

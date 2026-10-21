@@ -192,11 +192,12 @@ def test_transcription_report_done_failed_and_marking(missing_db,
     def fake_transcribe(path):
         if "TXBAD" in str(path):
             raise RuntimeError("boom: no audio stream")
-        return [(0.0, 2.0, "Transcribed dialogue line.")]
+        return ([(0.0, 2.0, "Transcribed dialogue line.")], "ur", 0.93)
 
     monkeypatch.setattr(youtube, "download_audio", fake_download)
     from backend import analyze
-    monkeypatch.setattr(analyze, "transcribe_audio_file", fake_transcribe)
+    monkeypatch.setattr(analyze, "transcribe_audio_file_meta",
+                        fake_transcribe)
 
     ids = {v["id"] for v in db.get_videos(pid)
            if v["youtube_id"] in ("TXOK0000001", "TXBAD000001")}
