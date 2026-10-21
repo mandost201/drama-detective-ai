@@ -245,35 +245,56 @@ def _transcribe_upload_info_small(vpath, task="transcribe"):
     from faster_whisper import WhisperModel
     model = WhisperModel("small", device="cpu", compute_type="int8")
     try:
-        kw = dict(beam_size=5, task=task, temperature=0.0,
-                  condition_on_previous_text=False)
+        def _run(language=None):
+            kw = dict(beam_size=5, task=task, temperature=0.0,
+                      condition_on_previous_text=False)
+            if language:
+                kw["language"] = language
 
-        def _run():
-            segments, info = model.transcribe(str(vpath), **kw)
-            # NOTE: the segment generator is consumed HERE, inside
-            # the (possibly PyAV-patched) call region - decoding
-            # happens during iteration, so patching only the
-            # transcribe() call itself is not enough.
-            segs = [(round(s.start, 1), round(s.end, 1),
-                     s.text.strip()) for s in segments
-                    if s.text.strip()]
-            return segs, getattr(info, "language", None), \
-                getattr(info, "language_probability", None)
+            def _once():
+                segments, info = model.transcribe(str(vpath), **kw)
+                # NOTE: the segment generator is consumed HERE,
+                # inside the (possibly PyAV-patched) call region -
+                # decoding happens during iteration, so patching
+                # only the transcribe() call itself is not enough.
+                segs = [(round(s.start, 1), round(s.end, 1),
+                         s.text.strip()) for s in segments
+                        if s.text.strip()]
+                return segs, getattr(info, "language", None), \
+                    getattr(info, "language_probability", None)
 
-        try:
-            return _run()
-        except TypeError:
-            import av
-            _orig = av.open
-
-            def _patched(*a, **k):
-                k.pop("metadata_errors", None)
-                return _orig(*a, **k)
-            av.open = _patched
             try:
-                return _run()
-            finally:
-                av.open = _orig
+                return _once()
+            except TypeError:
+                import av
+                _orig = av.open
+
+                def _patched(*a, **k):
+                    k.pop("metadata_errors", None)
+                    return _orig(*a, **k)
+                av.open = _patched
+                try:
+                    return _once()
+                finally:
+                    av.open = _orig
+
+        segs, lang, prob = _run()
+        if task == "transcribe" and segs:
+            joined = " ".join(t for _, _, t in segs)
+            if not any(ord(ch) > 0x250 for ch in joined):
+                # The decoder drifted into English-only output
+                # (measured live 2026-10-22: 74 English words and
+                # not one Hindi-script word, although the detector
+                # itself said 'hi'). These dramas are Urdu/Hindi -
+                # force the language and keep whichever hearing
+                # carries the original script: that is the half
+                # the script-bridge rescue alignment can match.
+                segs2, lang2, prob2 = _run(language="hi")
+                joined2 = " ".join(t for _, _, t in segs2)
+                if any(ord(ch) > 0x250 for ch in joined2) or \
+                        len(joined2.split()) > len(joined.split()):
+                    return segs2, lang2, prob2
+        return segs, lang, prob
     finally:
         del model
         import gc
