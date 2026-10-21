@@ -991,8 +991,17 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
                 esc_segs = []
                 diag["rescue_error"] = \
                     f"{type(_e).__name__}: {_e}"[:300]
+            if not esc_segs and "rescue_error" not in diag:
+                # The escalation returned normally but produced
+                # no segments at all - say so explicitly; a bare
+                # "attempted" line hid exactly this on live.
+                diag["rescue_error"] = \
+                    "escalated transcription returned no segments"
             if esc_segs:
                 esc_text = " ".join(t for _, _, t in esc_segs)
+                diag["rescue_escalated_words"] = len(esc_text.split())
+                diag["rescue_escalated_lang"] = _el
+                diag["rescue_escalated_sample"] = esc_text[:160]
                 _div = _diversity(esc_text)
                 if (_div is None or _div >= 0.15) and \
                         not _pass_is_weak(esc_text):

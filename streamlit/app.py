@@ -247,8 +247,21 @@ def _transcribe_upload_info_small(vpath, task="transcribe"):
     try:
         kw = dict(beam_size=5, task=task, temperature=0.0,
                   condition_on_previous_text=False)
-        try:
+
+        def _run():
             segments, info = model.transcribe(str(vpath), **kw)
+            # NOTE: the segment generator is consumed HERE, inside
+            # the (possibly PyAV-patched) call region - decoding
+            # happens during iteration, so patching only the
+            # transcribe() call itself is not enough.
+            segs = [(round(s.start, 1), round(s.end, 1),
+                     s.text.strip()) for s in segments
+                    if s.text.strip()]
+            return segs, getattr(info, "language", None), \
+                getattr(info, "language_probability", None)
+
+        try:
+            return _run()
         except TypeError:
             import av
             _orig = av.open
@@ -258,13 +271,9 @@ def _transcribe_upload_info_small(vpath, task="transcribe"):
                 return _orig(*a, **k)
             av.open = _patched
             try:
-                segments, info = model.transcribe(str(vpath), **kw)
+                return _run()
             finally:
                 av.open = _orig
-        segs = [(round(s.start, 1), round(s.end, 1), s.text.strip())
-                for s in segments if s.text.strip()]
-        return segs, getattr(info, "language", None), \
-            getattr(info, "language_probability", None)
     finally:
         del model
         import gc
@@ -1072,6 +1081,12 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
             if _diag.get("rescue_attempted"):
                 st.write("• Rescue transcription ki koshish hui "
                          "(bara model).")
+            if _diag.get("rescue_escalated_words") is not None:
+                st.write(f"• Rescue transcription: "
+                         f"{_diag['rescue_escalated_words']} alfaaz "
+                         f"({_diag.get('rescue_escalated_lang')}) — "
+                         f"namuna: "
+                         f"{_diag.get('rescue_escalated_sample')}")
             if _diag.get("rescue_error"):
                 st.write(f"• ⚠️ Rescue transcription fail hui: "
                          f"{_diag['rescue_error']}")
