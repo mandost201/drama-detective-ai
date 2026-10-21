@@ -95,6 +95,11 @@ def init_db():
         cols = [r[1] for r in con.execute("PRAGMA table_info(playlists)")]
         if "drama_name" not in cols:
             con.execute("ALTER TABLE playlists ADD COLUMN drama_name TEXT")
+        # migration: videos.transcript_source (captions / whisper /
+        # subtitle / seed / upload) - powers honest coverage stats
+        vcols = [r[1] for r in con.execute("PRAGMA table_info(videos)")]
+        if "transcript_source" not in vcols:
+            con.execute("ALTER TABLE videos ADD COLUMN transcript_source TEXT")
 
 
 @contextmanager
@@ -183,10 +188,42 @@ def get_video(vid):
         return dict(row) if row else None
 
 
-def mark_transcript(video_id, has):
+def mark_transcript(video_id, has, source=None):
     with get_con() as con:
-        con.execute("UPDATE videos SET has_transcript=? WHERE id=?",
-                    (1 if has else 0, video_id))
+        if source is not None:
+            con.execute("UPDATE videos SET has_transcript=?, "
+                        "transcript_source=? WHERE id=?",
+                        (1 if has else 0, source if has else None,
+                         video_id))
+        else:
+            con.execute("UPDATE videos SET has_transcript=? WHERE id=?",
+                        (1 if has else 0, video_id))
+
+
+def playlist_stats(pid):
+    """Honest per-playlist accounting for the results header:
+    discovered / searchable / missing / transcribed-by-source /
+    skipped (private or deleted entries)."""
+    vids = get_videos(pid)
+    by_source = {}
+    searchable = 0
+    skipped = 0
+    for v in vids:
+        if v.get("has_transcript"):
+            searchable += 1
+            src = v.get("transcript_source") or "captions"
+            by_source[src] = by_source.get(src, 0) + 1
+        title = (v.get("title") or "").strip().lower()
+        if title in ("private video", "deleted video",
+                     "[private video]", "[deleted video]"):
+            skipped += 1
+    return {
+        "total": len(vids), "searchable": searchable,
+        "missing": len(vids) - searchable, "by_source": by_source,
+        "transcribed": sum(by_source.get(s, 0) for s in
+                           ("whisper", "subtitle", "upload")),
+        "skipped": skipped,
+    }
 
 
 # ---- segments ----
