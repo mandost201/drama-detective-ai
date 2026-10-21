@@ -100,6 +100,22 @@ def init_db():
         vcols = [r[1] for r in con.execute("PRAGMA table_info(videos)")]
         if "transcript_source" not in vcols:
             con.execute("ALTER TABLE videos ADD COLUMN transcript_source TEXT")
+        # migration: playlists.source_id - the canonical identity of
+        # the source (YouTube playlist id, or a single video id),
+        # independent of the user-typed drama name and of this app's
+        # internal pid. Two entries can share a title; they can
+        # never share a (source_id, pid) identity by accident.
+        pcols = [r[1] for r in con.execute("PRAGMA table_info(playlists)")]
+        if "source_id" not in pcols:
+            con.execute("ALTER TABLE playlists ADD COLUMN source_id TEXT")
+        # backfill source_id for rows created before it existed
+        for r in con.execute(
+                "SELECT id, url FROM playlists WHERE source_id IS NULL"
+        ).fetchall():
+            sid = source_id_for(r[1])
+            if sid:
+                con.execute("UPDATE playlists SET source_id=? WHERE id=?",
+                            (sid, r[0]))
 
 
 @contextmanager
@@ -114,13 +130,41 @@ def get_con():
 
 
 # ---- playlists ----
+def source_id_for(url):
+    """Canonical source identity for a submitted URL:
+    'pl:<youtube playlist id>' or 'vi:<youtube video id>', else
+    None (identity uncertain - the caller must not proceed as if
+    the source were known)."""
+    from .youtube import extract_playlist_id, extract_video_id
+    pl = extract_playlist_id(url or "")
+    if pl:
+        return f"pl:{pl}"
+    vi = extract_video_id(url or "")
+    if vi:
+        return f"vi:{vi}"
+    return None
+
+
+def find_by_source(source_id):
+    """All playlist rows whose canonical source matches (there can
+    be several analyses of the same source; each keeps its own pid
+    and its own data - they are never merged silently)."""
+    if not source_id:
+        return []
+    with get_con() as con:
+        rows = con.execute("SELECT * FROM playlists WHERE source_id=?",
+                           (source_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
 def create_playlist(url, title=None):
     pid = uuid.uuid4().hex[:12]
     now = time.time()
     with get_con() as con:
         con.execute(
-            "INSERT INTO playlists(id,url,title,created_at,status) VALUES(?,?,?,?,?)",
-            (pid, url, title, now, "pending"),
+            "INSERT INTO playlists(id,url,title,created_at,status,source_id)"
+            " VALUES(?,?,?,?,?,?)",
+            (pid, url, title, now, "pending", source_id_for(url)),
         )
     return pid
 

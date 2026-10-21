@@ -88,3 +88,48 @@ def clip_block_reason(submitted, selected_pid, ready_ids):
         "ke episode se bachne ke liye clip us par match nahi kiya "
         "gaya. Pehle upar Step 1 se sahi playlist analyze karke ready "
         "karein, phir clip upload karein.")
+
+
+def identity_notice(submitted, selected_pid, by_id):
+    """A 'stop and correct' notice for Step 2/3, or None.
+
+    Shown when the playlist the user most recently submitted is NOT
+    the one currently selected because it never became ready: until
+    the user corrects the link (or deliberately picks another ready
+    playlist), every search screen must say plainly which playlist
+    searches will actually run against, so a failed submission can
+    never masquerade as a successful one. `by_id` maps playlist ids
+    to their rows for every playlist (any status)."""
+    if not submitted:
+        return None
+    sub_pid = submitted.get("pid")
+    if sub_pid is None or sub_pid == selected_pid:
+        return None
+    sub = by_id.get(sub_pid)
+    if sub is not None and sub.get("status") == "ready":
+        return None  # submitted one is fine; the switch was explicit
+    sel = by_id.get(selected_pid) or {}
+    sel_name = sel.get("drama_name") or sel.get("title") or "selected"
+    name = submitted.get("name") or (sub or {}).get("drama_name") \
+        or "submitted"
+    return (
+        f"⚠️ Identity check: aap ki aakhri submitted playlist "
+        f"('{name}') ready nahi hui — is liye abhi search sirf "
+        f"selected playlist '{sel_name}' par chalega, us nayi "
+        "playlist par NAHI. Agar aap ko usi nayi playlist par search "
+        "chahiye tha, to Step 1 mein us ka link theek karke dobara "
+        "analyze karein.")
+
+
+def confirmed_identity(p):
+    """One-line confirmed identity for a playlist row, built ONLY
+    from what was actually fetched (YouTube title, canonical source
+    id, real video count) — never from the user's typed name alone.
+    Returns '' when the row has no fetched title yet."""
+    title = (p or {}).get("title")
+    if not title:
+        return ""
+    src = (p or {}).get("source_id") or ""
+    count = (p or {}).get("video_count", 0)
+    return f"🔗 Confirmed: '{title}' • {count} videos" + \
+        (f" • source {src}" if src else "")
