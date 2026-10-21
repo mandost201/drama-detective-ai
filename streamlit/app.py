@@ -310,6 +310,21 @@ with st.expander("➕ Analyze a new playlist", expanded=st.session_state.active_
                 st.session_state["playlist_picker"] = pid
                 st.session_state.submitted = {
                     "pid": pid, "name": (drama_name or "").strip()}
+                # Identity transparency: if this exact source was
+                # submitted before, say so - the new analysis is a
+                # separate entry with its own data, never a silent
+                # merge with (or reuse of) the earlier one.
+                _sid = db.source_id_for(u)
+                _others = [p for p in db.find_by_source(_sid)
+                           if p["id"] != pid]
+                if _others:
+                    _o = _others[0]
+                    st.session_state.source_notice = (
+                        f"🔁 Isi source ({_sid}) ki aik entry pehle "
+                        f"se hai: '{_o.get('drama_name') or _o.get('title')}' "
+                        f"(status: {_o.get('status')}). Ye nayi "
+                        "analysis us se ALAG entry hai — purani entry "
+                        "ka data is mein istemal nahi hoga.")
             st.rerun()
 
 # ---------------------------------------------------------------- ingest progress
@@ -363,6 +378,8 @@ if jid:
                     f"{_cap} ke captions/transcripts indexed "
                     f"({_cov['pct']}% coverage). Ab search aur clip "
                     "finder isi playlist par chalenge.")
+                if sel_mod.confirmed_identity(_pl):
+                    st.caption(sel_mod.confirmed_identity(_pl))
                 st.session_state["playlist_picker"] = pid
             else:
                 st.session_state.analyze_error = (
@@ -381,6 +398,9 @@ if jid:
 
 if st.session_state.get("analyze_error"):
     st.error(st.session_state.analyze_error)
+
+if st.session_state.get("source_notice"):
+    st.info(st.session_state.pop("source_notice"))
 
 # ---------------------------------------------------------------- playlist picker
 # Selection is by stable playlist ID (widget key "playlist_picker"),
@@ -425,6 +445,9 @@ if _n_seeded:
     st.success(f"✅ Added verified transcripts for {_n_seeded} episode(s) missing captions.")
 vids = db.get_videos(pid)
 with_cap = sum(1 for v in vids if v.get("has_transcript"))
+_pl_sel = db.get_playlist(pid) or {}
+if sel_mod.confirmed_identity(_pl_sel):
+    st.caption(sel_mod.confirmed_identity(_pl_sel))
 _stats = db.playlist_stats(pid)
 _tx_note = (f" • {_stats['transcribed']} transcribed (Whisper/subtitle/"
             "upload)" if _stats["transcribed"] else "")
@@ -569,6 +592,11 @@ with st.sidebar:
 
 # ---------------------------------------------------------------- step 2: scene search
 st.header("Step 2 — Describe the scene (Exact Clip Finder)")
+_id_notice = sel_mod.identity_notice(
+    st.session_state.get("submitted"), pid,
+    {p["id"]: p for p in playlists})
+if _id_notice:
+    st.warning(_id_notice)
 st.caption("Har result ke saath scene ka estimated start–end range, playlist "
            "coverage aur matching dialogue saboot ke tor par diya jata hai. "
            "Range dialogue ki continuity se estimate hoti hai — ye exact "
