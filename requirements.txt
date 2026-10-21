@@ -1,0 +1,20 @@
+# Drama Detective AI - backend/API dependencies (the Streamlit app uses
+# streamlit/requirements.txt; both share the backend/ package)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+
+# YouTube access (no API key required path)
+yt-dlp>=2024.8.6
+youtube-transcript-api>=0.6.2
+
+# AI / ML (CPU friendly, ONNX based - no torch needed)
+fastembed>=0.3.6
+hf_transfer>=0.1.9  # fast, robust model downloads (used via HF_HUB_ENABLE_HF_TRANSFER)
+faster-whisper>=1.0.3
+
+# Image handling for screenshot analysis
+Pillow>=10.4
+pytesseract>=0.3.10   # optional: needs tesseract binary installed for OCR
+
+numpy>=1.26
