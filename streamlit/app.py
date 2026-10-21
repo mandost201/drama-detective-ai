@@ -869,21 +869,29 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
                  "tak mehdood rehta hai, doosri playlists ka data "
                  "kabhi istemal nahi hota.")
     else:
-        # A weak score is a weak candidate, never a "found it".
-        _best = max((r.get("score", 0) for r in _results_clip),
-                    default=0)
+        # Verdict banners are evidence-tiered (backend verdict):
+        # "verified" needs extensive clean dialogue evidence,
+        # "probable" is real but imperfect evidence the user must
+        # confirm against the matched line, and anything weaker was
+        # already suppressed by the pipeline as not a match at all.
+        _verdict = clip_res.get("verdict") or "not_verified"
         _how = _results_clip[0].get("method", "")
-        if _best < 0.5:
-            st.warning(f"⚠️ Sirf weak candidate(s) mile (best match "
-                       f"{_best:.0%}, {_how}). Ye verified exact "
-                       "match NAHI hai — clip is playlist ke kisi "
-                       "aur episode ka ho sakta hai, ya is ke "
-                       "captions adhooray hain. Neeche candidates "
-                       "sirf andaze ke tor par hain.")
+        if _verdict == "verified":
+            st.success(f"🟢 **EXACT MATCH VERIFIED** ({_how}). "
+                       "Dialogue saboot mazboot hai — episode, time "
+                       "aur matching lines neeche hain.")
+        elif _verdict == "probable":
+            st.warning(f"🟡 **PROBABLE MATCH** ({_how}). Saboot "
+                       "asal hai lekin kaamil nahi (masalan dheeli "
+                       "speech-to-text translation) — matching "
+                       "dialogue aur watch link se khud confirm kar "
+                       "lein. Ye verified exact match ka daawa nahi "
+                       "hai.")
         else:
-            st.success(f"✅ Strong candidate mila ({_how}, match "
-                       f"{_best:.0%}). Episode aur time neeche hai — "
-                       "evidence check kar lein.")
+            st.warning("Neeche ke candidates **verified match nahi** "
+                       "hain — ye sirf hints hain (masalan bina "
+                       "dialogue wale clip ke visual andaze). Inhe "
+                       "saboot ke tor par na lein.")
         _VIS_ICON = {"similar": "🖼️ Visual check: frames miltay "
                                 "jultay hain (supporting signal)",
                      "different": "🖼️ Visual check: frames match "
@@ -911,6 +919,12 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
             st.caption(_VIS_ICON.get(_vstat, "")
                        + (f" — {_vis.get('detail', '')}"
                           if _vis.get("detail") else ""))
+            if r.get("matched_lines"):
+                with st.expander("📜 Matching dialogue (saboot) — "
+                                 "episode ki asal lines, timestamps "
+                                 "ke saath"):
+                    for _ml in r["matched_lines"]:
+                        st.markdown(f"- `{_ml}`")
     if clip_res.get("clip_transcript"):
         with st.expander(f"Clip transcript (asal zuban: "
                          f"{clip_res.get('language') or '?'})"):
