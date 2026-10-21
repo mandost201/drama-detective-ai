@@ -201,7 +201,7 @@ def run_playlist_job(jid: str, pid: str, url: str):
                 segs = fetch_transcript(v["youtube_id"])
                 if segs:
                     db.add_segments(v["id"], segs)
-                    db.mark_transcript(v["id"], True, source="whisper")
+                    db.mark_transcript(v["id"], True, source="captions")
                 else:
                     db.mark_transcript(v["id"], False)
             except Exception as e:
