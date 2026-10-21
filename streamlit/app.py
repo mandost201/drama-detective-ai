@@ -36,6 +36,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from backend import db, ingest
+from backend import analyze as analyze_mod
 from backend import search as search_mod
 from backend import selection as sel_mod
 from backend import visual as visual_mod
@@ -145,7 +146,7 @@ def apply_seed_transcripts(pid):
             continue
         segs = [(float(s[0]), float(s[1]), str(s[2])) for s in seeds[yid]]
         db.add_segments(v["id"], segs)  # replaces existing segments
-        db.mark_transcript(v["id"], True)
+        db.mark_transcript(v["id"], True, source="seed")
         seeded.append(v["id"])
         seeded_yids.add(yid)
         print(f"[seeds] seeded transcript for {yid} ({len(segs)} segments)")
@@ -196,13 +197,14 @@ def _whisper_model():
     return WhisperModel("base", device="cpu", compute_type="int8")
 
 
-def _transcribe_upload(vpath, task="transcribe"):
-    """Transcribe an uploaded file, working around the faster-whisper/PyAV
-    metadata_errors incompatibility (old faster-whisper + new PyAV).
-    task='transcribe' (default) or 'translate' (translate to English)."""
+def _transcribe_upload_info(vpath, task="transcribe"):
+    """(segments, language, language_probability) for an upload.
+    Language is auto-detected by Whisper; task='translate' renders
+    the same speech in English (language then reports the SOURCE
+    language Whisper detected)."""
     model = _whisper_model()
     try:
-        segments, _info = model.transcribe(str(vpath), beam_size=5, task=task)
+        segments, info = model.transcribe(str(vpath), beam_size=5, task=task)
     except TypeError:
         import av
         _orig = av.open
@@ -212,11 +214,22 @@ def _transcribe_upload(vpath, task="transcribe"):
             return _orig(*a, **k)
         av.open = _patched
         try:
-            segments, _info = model.transcribe(str(vpath), beam_size=5, task=task)
+            segments, info = model.transcribe(str(vpath), beam_size=5,
+                                              task=task)
         finally:
             av.open = _orig
-    return [(round(s.start, 1), round(s.end, 1), s.text.strip())
+    segs = [(round(s.start, 1), round(s.end, 1), s.text.strip())
             for s in segments if s.text.strip()]
+    return segs, getattr(info, "language", None), \
+        getattr(info, "language_probability", None)
+
+
+def _transcribe_upload(vpath, task="transcribe"):
+    """Transcribe an uploaded file, working around the faster-whisper/PyAV
+    metadata_errors incompatibility (old faster-whisper + new PyAV).
+    task='transcribe' (default) or 'translate' (translate to English)."""
+    segs, _lang, _prob = _transcribe_upload_info(vpath, task=task)
+    return segs
 
 def _is_upload_video(r):
     return str(r.get("youtube_id") or "").startswith("upload-")
@@ -412,8 +425,14 @@ if _n_seeded:
     st.success(f"✅ Added verified transcripts for {_n_seeded} episode(s) missing captions.")
 vids = db.get_videos(pid)
 with_cap = sum(1 for v in vids if v.get("has_transcript"))
+_stats = db.playlist_stats(pid)
+_tx_note = (f" • {_stats['transcribed']} transcribed (Whisper/subtitle/"
+            "upload)" if _stats["transcribed"] else "")
+_skip_note = (f" • {_stats['skipped']} skipped (private/deleted)"
+              if _stats["skipped"] else "")
 st.caption(f"🎬 {DRAMA} • {len(vids)} episodes • {with_cap} with searchable "
-           f"captions/transcripts • {db.segment_count(pid):,} segments indexed")
+           f"captions/transcripts • {db.segment_count(pid):,} segments indexed"
+           + _tx_note + _skip_note)
 _cov = search_mod.playlist_coverage(pid)
 if _cov["total"]:
     if _cov["missing"]:
@@ -770,42 +789,19 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
     with open(cpath, "wb") as f:
         f.write(up2.getbuffer())
     try:
-        with st.spinner("Transcribing clip and matching against the playlist…"):
-            # transcribe + translate to English (episodes have English captions)
-            # without ffmpeg (not available on Streamlit Cloud)
-            segs = _transcribe_upload(cpath, task="translate")
-            clip_text = " ".join(t for _, _, t in segs)
-            if not clip_text.strip():
-                st.warning("No speech detected in the clip. Clips are matched by spoken dialogue.")
-                st.stop()
-            # align against the selected playlist (no ffmpeg needed)
-            # Strategy: (1) precise word alignment, (2) fallback to semantic
-            # search using the translated clip text as the query.
-            from backend.align import align_against_playlist
-            from backend import search as _search
-            from backend.vtt import format_hms
-            from backend.youtube import watch_url_at
-            videos = db.get_videos(pid)
-            pairs = []
-            for v in videos:
-                s = db.get_segments(v["id"])
-                if s:
-                    pairs.append((v, s))
-            ranked = align_against_playlist(clip_text, pairs)
-            # Fallback: if word alignment finds nothing, use semantic search
-            # with the clip transcript as the query.
-            _fallback_results = []
-            if not ranked:
-                _sr = _search.search(pid, clip_text, top_k=3)
-                for r in _sr.get("results", []):
-                    _fallback_results.append({
-                        "episode": r.get("episode", "?"),
-                        "title": r.get("title", ""),
-                        "timestamp_hms": r.get("timestamp_hms", ""),
-                        "url_at": r.get("url_at", ""),
-                        "confidence": r.get("confidence", ""),
-                        "score": r.get("score", 0),
-                    })
+        with st.spinner("Clip transcribe ho raha hai (asal zuban + "
+                        "English) aur playlist se match ho raha hai…"):
+            # Universal pipeline (backend/analyze.analyze_clip_full):
+            # original-language transcription with auto language
+            # detection, an English translation pass when needed,
+            # Unicode-aware dialogue alignment against THIS playlist
+            # only, semantic fallback, and a separate visual frame
+            # verification for the top candidate. The app's own
+            # Whisper model is passed in so only one model loads.
+            def _tf(path, task="transcribe"):
+                return _transcribe_upload_info(path, task=task)
+            clip_res = analyze_mod.analyze_clip_full(
+                pid, cpath, transcribe_fn=_tf)
     except Exception as e:
         st.error(f"Could not analyze the clip: {e}")
         st.stop()
@@ -814,54 +810,86 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
             cpath.unlink()
         except OSError:
             pass
-    if not ranked and not _fallback_results:
-        st.warning("No matching episode found. The clip's dialogue doesn't match any episode's transcript closely. "
-                   "Try describing the scene in words instead.")
-        with st.expander("Clip transcript (translated to English)"):
-            st.write(clip_text)
+    if not clip_res.get("ok"):
+        st.error(clip_res.get("error") or "Clip analyze nahi ho saka.")
         st.stop()
-
-    def _to_result(score, video, a):
-        conf = _search._confidence(score)
-        return {
-            "episode": video["position"], "title": video["title"],
-            "timestamp_hms": format_hms(a["offset"]),
-            "url_at": watch_url_at(video["youtube_id"], a["offset"]),
-            "confidence": conf, "score": round(score, 3),
-        }
-
-    if ranked:
-        results_clip = [_to_result(s, v, a) for s, v, a in ranked[:3]]
+    if clip_res.get("language"):
+        _lp = clip_res.get("language_probability")
+        st.caption(f"🗣️ Clip ki zuban (auto-detected): "
+                   f"**{clip_res['language']}**"
+                   + (f" — detector confidence {_lp:.0%}"
+                      if _lp is not None else "")
+                   + ". Asal zuban ka text mehfooz rakha gaya hai; "
+                     "zaroorat par English translation se bhi match "
+                     "kiya gaya hai.")
+    _ccov = clip_res.get("coverage") or {}
+    if _ccov.get("missing"):
+        st.warning(f"📊 Clip sirf {_ccov['searchable']}/{_ccov['total']} "
+                   f"indexed episodes mein dhoonda gaya. "
+                   f"{_ccov['missing']} episode(s) index nahi thay — "
+                   "unhe search kiya hi nahi gaya, is liye clip un "
+                   "mein bhi ho sakta hai.")
+    _results_clip = clip_res.get("results") or []
+    if clip_res.get("note"):
+        st.warning(clip_res["note"])
+    if not _results_clip:
+        st.error("**No verified match in this playlist.** Clip ka "
+                 "dialogue is playlist ke kisi indexed episode se "
+                 "match nahi hua. Agar clip kisi aur drama ka hai to "
+                 "wo drama ki playlist Step 1 mein add karke wahan "
+                 "try karein — search hamesha sirf selected playlist "
+                 "tak mehdood rehta hai, doosri playlists ka data "
+                 "kabhi istemal nahi hota.")
     else:
-        results_clip = _fallback_results
-    # A weak score is a weak candidate, never a "found it": 40%
-    # semantic similarity once sent a user to the wrong drama's
-    # episode with a success banner on top.
-    _best = max((r.get("score", 0) for r in results_clip), default=0)
-    _how = "precise dialogue match" if ranked else "semantic match"
-    if _best < 0.5:
-        st.warning(f"⚠️ Sirf weak candidate(s) mile (best match "
-                   f"{_best:.0%}, {_how}). Ye verified exact match "
-                   "NAHI hai — clip is playlist ke kisi aur episode "
-                   "ka ho sakta hai, ya is ke captions adhooray hain. "
-                   "Neeche candidates sirf andaze ke tor par hain.")
-    else:
-        st.success(f"✅ Strong candidate mila ({_how}, match "
-                   f"{_best:.0%}). Episode aur time neeche hai — "
-                   "evidence check kar lein.")
-    with st.expander("Clip transcript (translated to English)"):
-        st.write(clip_text)
-    for r in results_clip:
-        ep = r.get("episode", "?")
-        title = r.get("title", "")
-        ts = r.get("timestamp_hms", "")
-        url_at = r.get("url_at", "")
-        conf = r.get("confidence", "")
-        score = r.get("score", 0)
-        if url_at:
-            st.markdown(f"**{DRAMA} — Episode {ep}** @ `{ts}` — [{title}]({url_at}) — {conf} (match {score:.0%})")
+        # A weak score is a weak candidate, never a "found it".
+        _best = max((r.get("score", 0) for r in _results_clip),
+                    default=0)
+        _how = _results_clip[0].get("method", "")
+        if _best < 0.5:
+            st.warning(f"⚠️ Sirf weak candidate(s) mile (best match "
+                       f"{_best:.0%}, {_how}). Ye verified exact "
+                       "match NAHI hai — clip is playlist ke kisi "
+                       "aur episode ka ho sakta hai, ya is ke "
+                       "captions adhooray hain. Neeche candidates "
+                       "sirf andaze ke tor par hain.")
         else:
-            st.markdown(f"**{DRAMA} — Episode {ep}** @ `{ts}` — {title} — {conf} (match {score:.0%})")
+            st.success(f"✅ Strong candidate mila ({_how}, match "
+                       f"{_best:.0%}). Episode aur time neeche hai — "
+                       "evidence check kar lein.")
+        _VIS_ICON = {"similar": "🖼️ Visual check: frames miltay "
+                                "jultay hain (supporting signal)",
+                     "different": "🖼️ Visual check: frames match "
+                                  "NAHI hue — dialogue match ko "
+                                  "bhi shak se dekhein",
+                     "unavailable": "🖼️ Visual check: available nahi",
+                     "not_checked": "🖼️ Visual check: nahi hua"}
+        for r in _results_clip:
+            ep = r.get("episode", "?")
+            title = r.get("title", "")
+            url_at = r.get("url_at", "")
+            conf = r.get("confidence", "")
+            score = r.get("score", 0)
+            s_hms = r.get("scene_start_hms", r.get("timestamp_hms", ""))
+            e_hms = r.get("scene_end_hms", r.get("timestamp_hms", ""))
+            head = f"**{DRAMA} — Episode {ep}** @ `{s_hms} – {e_hms}` — "
+            head += (f"[{title}]({url_at})" if url_at else title)
+            head += f" — {conf} (match {score:.0%})"
+            st.markdown(head)
+            st.caption(f"Method: {r.get('method', '')}")
+            for _reason in r.get("reasons", []):
+                st.caption("• " + _reason)
+            _vis = r.get("visual") or {}
+            _vstat = _vis.get("status", "not_checked")
+            st.caption(_VIS_ICON.get(_vstat, "")
+                       + (f" — {_vis.get('detail', '')}"
+                          if _vis.get("detail") else ""))
+    if clip_res.get("clip_transcript"):
+        with st.expander(f"Clip transcript (asal zuban: "
+                         f"{clip_res.get('language') or '?'})"):
+            st.write(clip_res["clip_transcript"])
+    if clip_res.get("clip_transcript_en"):
+        with st.expander("Clip transcript (English translation)"):
+            st.write(clip_res["clip_transcript_en"])
 
 # ---------------------------------------------------------------- upload & analyze your own video
 st.divider()
@@ -900,7 +928,7 @@ if st.button("🔍 Analyze uploaded video", type="primary", key="analyze_up",
                              "url": "", "thumbnail": None}])
     v = db.get_videos(new_pid)[0]
     db.add_segments(v["id"], segs)
-    db.mark_transcript(v["id"], True)
+    db.mark_transcript(v["id"], True, source="upload")
     db.update_playlist(new_pid, status="ready", video_count=1)
     with st.spinner("Indexing for search…"):
         _embed_segments_for_videos(new_pid, {v["id"]})
