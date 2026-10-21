@@ -207,17 +207,68 @@ def fetch_transcript(video_id: str):
 
 
 def _download_subs(video_id, sub_langs, tmp, timeout=180):
-    cmd = YTDLP + ["--skip-download", "--no-warnings",
-                   "--write-subs", "--write-auto-subs",
-                   "--sub-langs", sub_langs, "--sub-format", "vtt",
-                   "--socket-timeout", "20",
-                   "-o", str(tmp / "%(id)s.%(ext)s"),
-                   watch_url(video_id)]
-    subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    return sorted(tmp.glob("*.vtt"))
+    """Download subtitle tracks into tmp. The android player client
+    goes first: YouTube bot-walls the web player path from server
+    IPs ("Sign in to confirm you're not a bot") while the android
+    client - the same route download_audio uses - keeps working.
+    Falls back to the default client when android yields nothing."""
+    base = YTDLP + ["--skip-download", "--no-warnings",
+                    "--write-subs", "--write-auto-subs",
+                    "--sub-langs", sub_langs, "--sub-format", "vtt",
+                    "--socket-timeout", "20",
+                    "-o", str(tmp / "%(id)s.%(ext)s")]
+    for extra in (["--extractor-args", "youtube:player_client=android"],
+                  []):
+        try:
+            subprocess.run(base + extra + [watch_url(video_id)],
+                           capture_output=True, text=True, timeout=timeout)
+        except Exception:
+            pass
+        files = sorted(tmp.glob("*.vtt"))
+        if files:
+            return files
+    return []
 
 
 def _transcript_ytdlp(video_id: str):
+    """yt-dlp subtitle download with one retry: YouTube answers
+    bursts of subtitle requests with HTTP 429 (transient), and a
+    single retry after a pause rescues otherwise-good episodes."""
+    for attempt in range(2):
+        segs = _transcript_ytdlp_once(video_id)
+        if segs:
+            return segs
+        if attempt == 0:
+            time.sleep(20)
+    return None
+
+
+_OTHER_LANG_ROW = re.compile(r"^([a-zA-Z][a-zA-Z-]{1,14})\s{2,}\S")
+
+
+def _probe_other_language(video_id):
+    """One cheap --list-subs request: the best caption language
+    OUTSIDE en/ur/hi that YouTube offers for this video, or None.
+    (Downloading 'all' tracks instead would fire dozens of requests
+    per video and trip YouTube's rate limit.)"""
+    try:
+        cmd = YTDLP + ["--skip-download", "--list-subs", "--no-warnings",
+                       "--socket-timeout", "20", watch_url(video_id)]
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=90)
+        langs = []
+        for line in (proc.stdout or "").splitlines():
+            m = _OTHER_LANG_ROW.match(line.strip())
+            if m and m.group(1).lower() not in ("language",):
+                langs.append(m.group(1))
+        rest = [l for l in dict.fromkeys(langs)
+                if l.split("-")[0].lower() not in _LANG_PREF]
+        return sorted(rest)[0] if rest else None
+    except Exception:
+        return None
+
+
+def _transcript_ytdlp_once(video_id: str):
     tmp = Path(tempfile.mkdtemp(prefix="sf_sub_"))
     try:
         # Pass 1: English / Urdu / Hindi tracks (manual or auto),
@@ -233,16 +284,20 @@ def _transcript_ytdlp(video_id: str):
                 segs = None
             if segs:
                 return segs
-        # Pass 2: literally any other language YouTube offers.
-        files = _download_subs(video_id, "all", tmp, timeout=240)
-        for f in files:
-            try:
-                segs = parse_vtt(f.read_text(encoding="utf-8",
-                                             errors="ignore"))
-            except Exception:
-                continue
-            if segs:
-                return segs
+        # Pass 2: ONE other language, chosen from the track list -
+        # any transcript beats no transcript, without a request storm.
+        lang = _probe_other_language(video_id)
+        if lang:
+            files = _download_subs(video_id, lang, tmp)
+            best = _pick_track(files, video_id)
+            if best is not None:
+                try:
+                    segs = parse_vtt(best.read_text(encoding="utf-8",
+                                                   errors="ignore"))
+                except Exception:
+                    segs = None
+                if segs:
+                    return segs
         return None
     except Exception:
         return None

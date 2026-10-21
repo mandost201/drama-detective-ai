@@ -93,6 +93,39 @@ def test_fetch_transcript_uses_non_english_tracks(monkeypatch):
     assert "ur" in first[first.index("--sub-langs") + 1]
 
 
+LIST_SUBS_SAMPLE = """[youtube] abc: Downloading webpage
+Available automatic captions for abc:
+Language Name                  Formats
+en       English               vtt, srt
+ur       Urdu                  vtt, srt
+ar       Arabic                vtt, srt
+fa       Persian               vtt, srt
+
+Available subtitles for abc:
+Language Name       Formats
+hi       Hindi      vtt, srt
+"""
+
+
+def test_probe_other_language_picks_beyond_pref(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, LIST_SUBS_SAMPLE, "")
+
+    monkeypatch.setattr(youtube.subprocess, "run", fake_run)
+    # en/ur/hi are pass-1 languages; the probe must offer another
+    assert youtube._probe_other_language("abc") == "ar"
+
+
+def test_probe_other_language_none_when_only_preferred(monkeypatch):
+    only = ("Available subtitles for abc:\n"
+            "Language Name       Formats\n"
+            "en       English    vtt\nur       Urdu       vtt\n")
+    monkeypatch.setattr(
+        youtube.subprocess, "run",
+        lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, only, ""))
+    assert youtube._probe_other_language("abc") is None
+
+
 # ------------------------------------------- subtitle upload indexing
 
 @pytest.fixture(scope="module")
