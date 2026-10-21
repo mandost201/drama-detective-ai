@@ -15,6 +15,20 @@ An episode counts as searchable **only** when transcript segments are actually i
 
 1. **Broader caption fetch (automatic).** The fetcher no longer asks YouTube for English only: it tries English, Urdu and Hindi tracks (manual or auto), then one further language chosen from the video's track list. Downloads go through the android player client first (YouTube bot-walls the web path from server IPs), with one paused retry, because YouTube also rate-limits (HTTP 429) subtitle bursts — both are transient, and re-analyzing later fills in episodes that were blocked. (The English-only request was the actual root cause for playlists where most episodes showed as caption-less.)
 
+## Playlist integrity
+
+Every playlist has two identities, and the app never confuses them:
+
+- an internal id (`pid`) that owns its videos, transcripts, embeddings and search results — everything is bound to it, so one drama's data can never surface inside another's;
+- a canonical **source id** (`pl:<YouTube playlist id>` or `vi:<video id>`) recorded when the URL is submitted.
+
+What this means in practice:
+
+- A submitted URL is validated before anything is created; an unreadable/private source ends in an explicit **error state**, never in a silent fall-back to a previous drama.
+- After an analysis, the app displays the **confirmed** identity — the title YouTube actually returned, the real video count, and the source id — not just the name you typed. Re-submitting the same source creates a separate, clearly-labelled entry (fresh data for re-checks); it is never silently merged with, or served from, the earlier one.
+- If your last submitted playlist never became ready, Step 2 and the clip finder say so plainly and name the playlist searches *will* run against, until you correct the link. Clip search in that situation is blocked outright.
+- Search caches are keyed by playlist id and invalidated whenever that playlist's data changes (new transcripts, subtitle uploads, re-analysis), so stale results cannot leak into a new search.
+
 ## Universal clip finder
 
 Upload a short clip of a scene — from a drama of any country or language — and the app works out which episode of the **selected playlist** it came from:
