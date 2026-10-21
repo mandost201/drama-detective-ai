@@ -9,6 +9,16 @@ Find the **exact episode and timestamp** of a scene from a drama playlist.
 
 Also included: **clip finder** (upload a short clip → its episode + timestamp), **video upload** (any video file → transcribed → searchable at the exact second), **recent searches**, and **feedback/correction** when a suggested episode is wrong.
 
+## Exact Clip Finder (upgraded search results)
+
+Every Step-2 result now also carries:
+
+- **Estimated scene range** `HH:MM:SS – HH:MM:SS`, not just one second. The range is an *estimate* derived from the matched dialogue: the anchor segment's dialogue block (pauses up to 20s count as the same scene — real subtitle tracks pause inside scenes), trimmed to the outermost segments matching your distinctive terms plus a short lead-in/out, capped at 5 minutes. The watch link opens at the scene start.
+- **Playlist coverage** — how many episodes were actually searched (`searchable/total`, %). Episodes without captions are counted and reported, never silently skipped. When coverage is under 50%, confidence is capped at Medium: the scene may be in an episode that could not be checked.
+- **Playable preview** — the top result embeds YouTube's official player cued to the scene's start/end. It is a player, **not** a downloadable clip.
+- **Visual check** — on demand, the app extracts real frames from YouTube's public storyboard preview images at the scene's start/middle/end (downloaded via yt-dlp, cropped locally; cached per video). The frames are evidence for *your* eyes next to the dialogue — the app runs no vision model and never claims to have recognized characters or actions in a frame. If a video has no storyboards, the app says so instead of pretending.
+- The top three candidates are ranked; you can confirm or correct the match (feedback is stored locally), and weaker alternatives are listed with their scene ranges.
+
 ---
 
 ## Evidence rules (never faked)
