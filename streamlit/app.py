@@ -1058,6 +1058,27 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
                          "nahi gaya.")
             st.write(f"• Failure kind: "
                      f"**{clip_res.get('failure_kind')}**")
+            if _diag.get("rescue"):
+                _ri = _diag["rescue"]
+                st.write(f"• Rescue (script-bridge) chala: "
+                         f"{_ri.get('distinct_segments')} hisse, "
+                         f"{_ri.get('cluster_matched_words')} matched "
+                         f"alfaaz"
+                         + (f", clip episode ke "
+                            f"{_ri.get('clip_start_in_episode')}s se "
+                            "shuru (anchor hisaab)"
+                            if _ri.get("clip_start_in_episode")
+                            else ""))
+            if _diag.get("rescue_attempted"):
+                st.write("• Rescue transcription ki koshish hui "
+                         "(bara model).")
+            if _diag.get("rescue_error"):
+                st.write(f"• ⚠️ Rescue transcription fail hui: "
+                         f"{_diag['rescue_error']}")
+            if _diag.get("weak_passes"):
+                st.write(f"• Kamzor (loop/formulaic) pass matching "
+                         f"se bahar rakhe gaye: "
+                         f"{', '.join(_diag['weak_passes'])}")
     _results_clip = clip_res.get("results") or []
     if clip_res.get("note") and _results_clip:
         st.warning(clip_res["note"])
