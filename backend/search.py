@@ -334,7 +334,26 @@ def semantic_search(pid, query, top_k=8):
 
 
 def search(pid, query, mode="auto", top_k=8):
-    """Combined search. Returns dict with results, alternatives, method info."""
+    """Combined search. Returns dict with results, alternatives,
+    method info.
+
+    A query written in Urdu or Devanagari script whose own tokens
+    match nothing (names have no concept-map entries) is retried
+    with its Latin transliterations - the first candidate that
+    produces results wins, and the result records which query
+    actually ran ("effective_query") so nothing is hidden."""
+    res = _search_impl(pid, query, mode=mode, top_k=top_k)
+    if res["results"]:
+        return res
+    for cand in normalize.latin_candidates(query):
+        alt = _search_impl(pid, cand, mode=mode, top_k=top_k)
+        if alt["results"]:
+            alt["effective_query"] = cand
+            return alt
+    return res
+
+
+def _search_impl(pid, query, mode="auto", top_k=8):
     query = (query or "").strip()
     if not query:
         return {"results": [], "alternatives": [], "method": "none",

@@ -49,6 +49,137 @@ def tokens(text):
     return _TOKEN.findall(_normalize_script(text or "").lower())
 
 
+# ------------------------------------------------- script transliteration
+# Names have no concept-map entries, so an Urdu/Hindi-script NAME
+# query ("رانیہ مرزا") used to match nothing at all against English
+# subtitles. A mechanical transliteration to Latin - plus the
+# spelling folds Roman Urdu is full of - turns it into candidate
+# Latin queries the normal pipeline can run. This only ever
+# rewrites the QUERY; transcript text is never altered.
+_URDU_MAP = {
+    "ا": "a", "آ": "a", "ٲ": "a", "ب": "b", "پ": "p", "ت": "t",
+    "ٹ": "t", "ث": "s", "ج": "j", "چ": "ch", "ح": "h", "خ": "kh",
+    "د": "d", "ڈ": "d", "ذ": "z", "ر": "r", "ڑ": "r", "ز": "z",
+    "ژ": "zh", "س": "s", "ش": "sh", "ص": "s", "ض": "z", "ط": "t",
+    "ظ": "z", "ع": "a", "غ": "gh", "ف": "f", "ق": "q", "ک": "k",
+    "گ": "g", "ل": "l", "م": "m", "ن": "n", "ں": "n", "و": "o",
+    "ہ": "h", "ھ": "h", "ۃ": "h", "ی": "i", "ے": "e", "ئ": "i",
+    "ؤ": "o", "ء": "", "ئ": "i",
+}
+_URDU_DIACRITICS = set("ًٌٍَُِّْٰٓٔ")
+
+_DEV_CONS = {
+    "क": "k", "ख": "kh", "ग": "g", "घ": "gh", "ङ": "ng", "च": "ch",
+    "छ": "ch", "ज": "j", "झ": "jh", "ञ": "ny", "ट": "t", "ठ": "th",
+    "ड": "d", "ढ": "dh", "ण": "n", "त": "t", "थ": "th", "द": "d",
+    "ध": "dh", "न": "n", "प": "p", "फ": "f", "ब": "b", "भ": "bh",
+    "म": "m", "य": "y", "र": "r", "ल": "l", "व": "v", "श": "sh",
+    "ष": "sh", "स": "s", "ह": "h",
+}
+_DEV_NUKTA = {"क": "q", "ख": "kh", "ग": "g", "ज": "z", "ड": "d",
+              "ढ": "dh", "फ": "f"}
+_DEV_VOWEL = {"अ": "a", "आ": "aa", "इ": "i", "ई": "ii", "उ": "u",
+              "ऊ": "oo", "ऋ": "ri", "ए": "e", "ऐ": "ai", "ओ": "o",
+              "औ": "au", "ऑ": "o"}
+_DEV_MATRA = {"ा": "aa", "ि": "i", "ी": "ii", "ु": "u", "ू": "oo",
+              "ृ": "ri", "े": "e", "ै": "ai", "ो": "o", "ौ": "au",
+              "ॉ": "o", "ं": "n", "ः": "h", "ँ": "n"}
+
+
+def _transliterate_devanagari(text):
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in _DEV_CONS:
+            base = _DEV_CONS[ch]
+            j = i + 1
+            if j < n and text[j] == "़":  # nukta changes the letter
+                base = _DEV_NUKTA.get(ch, base)
+                j += 1
+            out.append(base)
+            if j < n and text[j] == "्":  # virama: cluster, no vowel
+                i = j + 1
+                continue
+            if j < n and text[j] in _DEV_MATRA:
+                out.append(_DEV_MATRA[text[j]])
+                i = j + 1
+                continue
+            out.append("a")  # inherent vowel
+            i = j
+            continue
+        if ch in _DEV_VOWEL:
+            out.append(_DEV_VOWEL[ch])
+        elif ch in _DEV_MATRA:
+            out.append(_DEV_MATRA[ch])
+        elif ch in ("़", "्"):
+            pass
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def transliterate(text):
+    """Latin transliteration of Urdu (Arabic script) and Hindi
+    (Devanagari) text; Latin text passes through unchanged."""
+    t = _normalize_script(text or "")
+    # Urdu: a word-internal یہ is the digraph "ia" (رانیہ = Rania),
+    # not i+h. A standalone یہ keeps its own reading.
+    t = re.sub(r"(?<=[؀-ۿ])یہ", "ia", t)
+    out = []
+    for ch in t:
+        if ch in _URDU_DIACRITICS:
+            continue
+        out.append(_URDU_MAP.get(ch, ch))
+    t = "".join(out)
+    if _DEVANAGARI.search(t):
+        t = _transliterate_devanagari(t)
+    return t
+
+
+def _fold_token(tok):
+    """Spelling folds for transliterated tokens only: doubled
+    vowels collapse, a trailing silent h drops, -iya- reads -ia-.
+    (رانیہ -> raniyah -> rania; शादी -> shaadii -> shadi.)"""
+    t = tok
+    t = t.replace("iya", "ia")
+    t = t.replace("aa", "a").replace("ee", "i").replace("oo", "u")
+    t = t.replace("ii", "i")
+    if len(t) > 3 and t.endswith("h"):
+        t = t[:-1]
+    return t
+
+
+def _vowel_inserted(tok):
+    """Urdu script omits short vowels: مرزا is written 'mrza' but
+    read 'Mirza'. As a LAST-resort candidate, a token that starts
+    with two consonants gets an 'i' after its first letter. This
+    only ever adds one more candidate query - ranking and
+    coverage still decide what matches."""
+    if (len(tok) >= 4 and tok[0] not in "aeiou"
+            and tok[1] not in "aeiou"):
+        return tok[0] + "i" + tok[1:]
+    return tok
+
+
+def latin_candidates(query):
+    """For a query written in Urdu or Devanagari script: candidate
+    Latin rewrites, best first. Empty list for Latin queries (the
+    normal path already handles those)."""
+    if detect_script(query or "") == "latin":
+        return []
+    tr = transliterate(query)
+    folded = " ".join(_fold_token(t) for t in tr.split())
+    rescued = " ".join(_vowel_inserted(t) for t in folded.split())
+    out = []
+    for cand in (folded, tr, rescued):
+        cand = " ".join(cand.split()).strip()
+        if cand and cand not in out:
+            out.append(cand)
+    return out
+
+
 # ------------------------------------------- Roman Urdu spelling variants
 # canonical form -> known variants (every variant maps back to canonical)
 _VARIANT_GROUPS = [
