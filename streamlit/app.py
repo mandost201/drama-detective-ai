@@ -204,7 +204,9 @@ def _transcribe_upload_info(vpath, task="transcribe"):
     language Whisper detected)."""
     model = _whisper_model()
     try:
-        segments, info = model.transcribe(str(vpath), beam_size=5, task=task)
+        segments, info = model.transcribe(str(vpath), beam_size=5, task=task,
+                                          temperature=0.0,
+                                          condition_on_previous_text=False)
     except TypeError:
         import av
         _orig = av.open
@@ -215,7 +217,9 @@ def _transcribe_upload_info(vpath, task="transcribe"):
         av.open = _patched
         try:
             segments, info = model.transcribe(str(vpath), beam_size=5,
-                                              task=task)
+                                              task=task,
+                                              temperature=0.0,
+                                              condition_on_previous_text=False)
         finally:
             av.open = _orig
     segs = [(round(s.start, 1), round(s.end, 1), s.text.strip())
@@ -466,6 +470,28 @@ if _cov["total"]:
     else:
         st.caption(f"📊 Playlist coverage: tamam {_cov['total']} episodes "
                    "searchable (100%).")
+
+# Playlist inventory: the four numbers the clip finder depends on,
+# reported separately - kitni videos mili, kitni accessible hain,
+# kitni ke transcripts index hain, aur kitni fail hui. A clip can
+# only match an episode from the "indexed" group.
+with st.expander("📋 Playlist inventory — discovered / accessible / "
+                 "indexed / failed"):
+    _inv_indexed = [v for v in vids if v.get("has_transcript")]
+    _inv_failed = [v for v in vids if not v.get("has_transcript")]
+    st.write(f"• Discovered videos: **{len(vids)}**")
+    st.write(f"• Accessible (private/deleted nahi): "
+             f"**{len(vids) - _stats['skipped']}**")
+    st.write(f"• Indexed transcripts (searchable): "
+             f"**{len(_inv_indexed)}** — "
+             f"{db.segment_count(pid):,} segments")
+    st.write(f"• Failed / transcript nahi: **{len(_inv_failed)}**")
+    for _fv in _inv_failed[:10]:
+        st.caption(f"— {_fv.get('title', '')} (transcript nahi — "
+                   "clip is episode mein ho to match nahi ho sakta "
+                   "jab tak transcribe na ho)")
+    if len(_inv_failed) > 10:
+        st.caption(f"…aur {len(_inv_failed) - 10} aur episodes")
 
 # ---- episodes without captions: real fallbacks, honestly reported --
 # An episode counts as searchable ONLY when transcript segments are
@@ -967,17 +993,76 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
                    f"{_ccov['missing']} episode(s) index nahi thay — "
                    "unhe search kiya hi nahi gaya, is liye clip un "
                    "mein bhi ho sakta hai.")
+    _diag = clip_res.get("diagnostics") or {}
+    if _diag:
+        with st.expander("🔍 Clip diagnostics — pipeline ki report"):
+            st.write(f"• Clip file read: "
+                     f"**{'OK' if _diag.get('clip_read') else 'FAIL'}**"
+                     f" • Duration: **{_diag.get('clip_duration_s')}s**"
+                     f" • Audio extraction: "
+                     f"**{_diag.get('audio_extraction')}**")
+            st.write(f"• Clip transcript: asal zuban mein "
+                     f"**{_diag.get('transcript_words_original')}** "
+                     f"alfaaz, English mein "
+                     f"**{_diag.get('transcript_words_english')}** "
+                     "alfaaz")
+            st.write(f"• Search hui: "
+                     f"**{_diag.get('episodes_searched')}** episodes "
+                     f"(playlist ki {_diag.get('playlist_videos_total')}"
+                     f" mein se {_diag.get('episodes_with_transcripts')}"
+                     f" indexed thay), "
+                     f"{_diag.get('segments_searched')} segments")
+            _ba = _diag.get("best_alignment")
+            if _ba:
+                st.write(f"• Sab se mazboot dialogue saboot: score "
+                         f"**{_ba['score']}**, matched alfaaz "
+                         f"**{_ba['matched_words']}** "
+                         f"({_ba['episode_title']}) — agar ye hadd se "
+                         "neeche tha to result roka gaya, chhupaya "
+                         "nahi gaya.")
+            st.write(f"• Failure kind: "
+                     f"**{clip_res.get('failure_kind')}**")
     _results_clip = clip_res.get("results") or []
-    if clip_res.get("note"):
+    if clip_res.get("note") and _results_clip:
         st.warning(clip_res["note"])
     if not _results_clip:
-        st.error("**No verified match in this playlist.** Clip ka "
-                 "dialogue is playlist ke kisi indexed episode se "
-                 "match nahi hua. Agar clip kisi aur drama ka hai to "
-                 "wo drama ki playlist Step 1 mein add karke wahan "
-                 "try karein — search hamesha sirf selected playlist "
-                 "tak mehdood rehta hai, doosri playlists ka data "
-                 "kabhi istemal nahi hota.")
+        _fk = clip_res.get("failure_kind")
+        if _fk == "no_searchable_episodes":
+            st.error("**Match mumkin hi nahi tha — data missing hai.** "
+                     "Selected playlist ki kisi bhi episode ka "
+                     "transcript index nahi hai, is liye clip kisi "
+                     "episode se match ho hi nahi sakta tha. Ye "
+                     "'searched, no match' wala case NAHI hai. Step 1 "
+                     "mein playlist ka analysis mukammal karein ya "
+                     "missing episodes ko transcribe karein, phir "
+                     "dobara try karein.")
+        elif _fk == "no_speech":
+            st.error("**Clip mein koi dialogue nahi mila.** Ya clip "
+                     "mein sirf music hai, ya audio sunai nahi de "
+                     "raha. Neeche sirf visual hints ho sakte hain — "
+                     "verified match nahi.")
+        elif _fk == "transcript_too_short":
+            st.error("**Clip ki guftagu bohat kam thi** (5 se kam "
+                     "alfaaz transcribe hue) — itni kam guftagu se "
+                     "episode verify nahi ho sakta. Thora lamba ya "
+                     "wazeh dialogue wala clip try karein.")
+        elif _fk == "transcript_degenerate":
+            st.error("**Clip saaf sunai nahi diya.** Whisper ne clip "
+                     "ki awaz ko loop/gibberish ki surat mein suna "
+                     "(aksar tez background music ya rone ki awaz "
+                     "wale scenes mein hota hai) — is kharab text se "
+                     "koi episode match karna galat hota, is liye "
+                     "koi result nahi diya gaya. Wazeh dialogue wala "
+                     "hissa clip karke dobara try karein.")
+        else:
+            st.error("**No verified match in this playlist.** "
+                     f"{_diag.get('episodes_searched', 0)} indexed "
+                     "episodes asal mein search hue, lekin clip ka "
+                     "saboot kisi se match nahi hua (sab se mazboot "
+                     "saboot diagnostics mein hai). Agar clip kisi aur "
+                     "drama ka hai to us drama ki playlist Step 1 mein "
+                     "add karke wahan try karein — search hamesha sirf "
+                     "selected playlist tak mehdood rehta hai.")
     else:
         # Verdict banners are evidence-tiered (backend verdict):
         # "verified" needs extensive clean dialogue evidence,
