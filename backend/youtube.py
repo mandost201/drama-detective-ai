@@ -157,6 +157,44 @@ def _fetch_via_ytdlp(url):
 
 
 # ---------------------------------------------------------------- captions
+# Language preference for caption tracks. The app originally fetched
+# ENGLISH ONLY ("--sub-langs en.*"), so any episode whose YouTube
+# captions were Urdu/Hindi/other was falsely reported as having "no
+# captions" and excluded from search. Now the languages the app's
+# users actually search in are tried first (English, then Urdu, then
+# Hindi), and after that ANY language YouTube offers - a transcript
+# in any language is searchable and beats no transcript at all.
+_LANG_PREF = ("en", "ur", "hi")
+
+
+def _track_lang(filename, video_id):
+    """'YDu9akegEHU.en-US.vtt' -> 'en-US' (the part between the
+    video id and the extension)."""
+    name = filename[:-4] if filename.endswith(".vtt") else filename
+    prefix = (video_id or "") + "."
+    if prefix != "." and name.startswith(prefix):
+        return name[len(prefix):]
+    return name
+
+
+def _lang_rank(lang):
+    base = (lang or "").split("-")[0].lower()
+    for i, p in enumerate(_LANG_PREF):
+        if base == p:
+            return i
+    return len(_LANG_PREF)
+
+
+def _pick_track(files, video_id):
+    """Best downloaded .vtt by language preference (en > ur > hi >
+    anything else), deterministic by filename after that."""
+    if not files:
+        return None
+    return sorted(files,
+                  key=lambda f: (_lang_rank(_track_lang(f.name, video_id)),
+                                 f.name))[0]
+
+
 def fetch_transcript(video_id: str):
     """Return list of (start,end,text) or None if unavailable/restricted."""
     segs = _transcript_ytdlp(video_id)
@@ -168,23 +206,39 @@ def fetch_transcript(video_id: str):
         return None
 
 
+def _download_subs(video_id, sub_langs, tmp, timeout=180):
+    cmd = YTDLP + ["--skip-download", "--no-warnings",
+                   "--write-subs", "--write-auto-subs",
+                   "--sub-langs", sub_langs, "--sub-format", "vtt",
+                   "--socket-timeout", "20",
+                   "-o", str(tmp / "%(id)s.%(ext)s"),
+                   watch_url(video_id)]
+    subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return sorted(tmp.glob("*.vtt"))
+
+
 def _transcript_ytdlp(video_id: str):
     tmp = Path(tempfile.mkdtemp(prefix="sf_sub_"))
     try:
-        cmd = YTDLP + ["--skip-download", "--no-warnings",
-               "--write-subs", "--write-auto-subs",
-               "--sub-langs", "en.*", "--sub-format", "vtt",
-               "--socket-timeout", "20",
-               "-o", str(tmp / "%(id)s.%(ext)s"),
-               watch_url(video_id)]
-        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        files = sorted(tmp.glob("*.vtt"),
-                       key=lambda p: (0 if ".en." in p.name and "auto" not in p.name
-                                      else 1, p.name))
-        # prefer manual English, then auto English
+        # Pass 1: English / Urdu / Hindi tracks (manual or auto),
+        # best language wins. This is the pass that rescues episodes
+        # whose only captions are not in English.
+        files = _download_subs(video_id, "en.*,ur.*,hi.*", tmp)
+        best = _pick_track(files, video_id)
+        if best is not None:
+            try:
+                segs = parse_vtt(best.read_text(encoding="utf-8",
+                                               errors="ignore"))
+            except Exception:
+                segs = None
+            if segs:
+                return segs
+        # Pass 2: literally any other language YouTube offers.
+        files = _download_subs(video_id, "all", tmp, timeout=240)
         for f in files:
             try:
-                segs = parse_vtt(f.read_text(encoding="utf-8", errors="ignore"))
+                segs = parse_vtt(f.read_text(encoding="utf-8",
+                                             errors="ignore"))
             except Exception:
                 continue
             if segs:

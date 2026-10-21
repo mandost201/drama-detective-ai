@@ -28,11 +28,26 @@ def _seeded_youtube_ids():
         return set()
 
 
-def transcribe_missing_episodes(pid, progress_fn=None):
+_tx_reports = {}
+
+
+def last_transcription_report(pid):
+    """The most recent transcription report for a playlist (in this
+    server process): {"requested", "done", "failed": [{title,
+    youtube_id, error}], "skipped_seeded"} or None."""
+    return _tx_reports.get(pid)
+
+
+def transcribe_missing_episodes(pid, progress_fn=None, video_ids=None):
     """Transcribe audio for videos that have no captions/transcript.
-    Returns the number of videos newly transcribed. progress_fn(stage,
-    current, total) is called for UI updates. Safe to call anytime;
-    skips videos already transcribed or covered by bundled seeds."""
+
+    Only videos the app could legitimately access are processed (the
+    same public audio download used everywhere else - no DRM or
+    access-control bypass). A video is marked searchable ONLY after
+    its transcript segments are actually indexed. Returns a report
+    dict (see last_transcription_report); per-episode failures are
+    recorded in the report, never silently swallowed. Safe to call
+    anytime; skips videos already transcribed or covered by seeds."""
     from pathlib import Path as _P
     from . import analyze as _analyze
     from .youtube import download_audio as _dl_audio
@@ -42,16 +57,22 @@ def transcribe_missing_episodes(pid, progress_fn=None):
             progress_fn(stage, cur, tot)
 
     missing = [v for v in db.get_videos(pid) if not v["has_transcript"]]
+    if video_ids is not None:
+        wanted = set(video_ids)
+        missing = [v for v in missing if v["id"] in wanted]
     seeded_ids = _seeded_youtube_ids()
+    skipped = [v for v in missing if v["youtube_id"] in seeded_ids]
     missing = [v for v in missing if v["youtube_id"] not in seeded_ids]
+    report = {"requested": len(missing) + len(skipped), "done": 0,
+              "failed": [], "skipped_seeded": len(skipped)}
     if not missing:
-        return 0
+        _tx_reports[pid] = report
+        return report
     tmpdir = _P(tempfile.mkdtemp(prefix="sf_whisper_"))
-    done = 0
     try:
         for i, v in enumerate(missing):
             yid = v["youtube_id"]
-            _prog(f"Transcribing audio ({i+1}/{len(missing)})", i, len(missing))
+            _prog(f"Transcribing: {v['title']}", i, len(missing))
             mp3 = tmpdir / f"{yid}.mp3"
             try:
                 _dl_audio(yid, mp3)
@@ -59,11 +80,19 @@ def transcribe_missing_episodes(pid, progress_fn=None):
                 if segs:
                     db.add_segments(v["id"], segs)
                     db.mark_transcript(v["id"], True)
-                    done += 1
+                    report["done"] += 1
                     print(f"[ingest] whisper ok: {yid} ({len(segs)} segs)")
                 else:
+                    report["failed"].append({
+                        "title": v["title"], "youtube_id": yid,
+                        "error": "Whisper ne koi dialogue nahi pehchana "
+                                 "(khaali transcript) — audio mein "
+                                 "guftagu nahi mili."})
                     print(f"[ingest] whisper empty: {yid}")
             except Exception as e:
+                report["failed"].append({
+                    "title": v["title"], "youtube_id": yid,
+                    "error": str(e)[:300]})
                 print(f"[ingest] whisper failed for {yid}: {e}")
             finally:
                 try:
@@ -75,12 +104,77 @@ def transcribe_missing_episodes(pid, progress_fn=None):
             tmpdir.rmdir()
         except OSError:
             pass
-    if done:
+    if report["done"]:
         # re-index so the new transcripts are semantically searchable
         _index_embeddings(pid)
         search_mod.invalidate_cache(pid)
+    _tx_reports[pid] = report
     _prog("done", len(missing), len(missing))
-    return done
+    return report
+
+
+def start_transcription_job(pid, video_ids=None):
+    """Run transcribe_missing_episodes as a tracked background job
+    (progress + outcome visible in the UI via the jobs table)."""
+    jid = db.create_job("transcribe", pid)
+
+    def _run():
+        def progress(stage, current, total):
+            db.update_job(jid, status="running", stage=stage,
+                          current=current, total=total)
+        try:
+            rep = transcribe_missing_episodes(
+                pid, progress_fn=progress, video_ids=video_ids)
+            db.update_job(jid, status="done", stage="done",
+                          current=rep["done"] + len(rep["failed"]),
+                          total=max(1, rep["requested"]))
+        except Exception as e:
+            db.update_job(jid, status="error", error=str(e))
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return jid
+
+
+def _index_embeddings_for_video(pid, video_row_id):
+    """Embed just one video's segments (used after a subtitle upload,
+    so the episode becomes semantically searchable immediately)."""
+    if not embeddings.available():
+        return
+    batch, seg_ids = [], []
+    for s in db.get_segments(video_row_id):
+        if len(s["text"]) < 3:
+            continue
+        seg_ids.append(s["id"])
+        batch.append(s["text"][:500])
+    B = 64
+    for i in range(0, len(batch), B):
+        try:
+            vecs = embeddings.embed(batch[i:i + B])
+        except Exception as e:
+            print(f"[ingest] embedding batch failed: {e}")
+            break
+        pairs = [(seg_ids[i + j], int(vecs.shape[1]),
+                  vecs[j].astype(np.float32).tobytes())
+                 for j in range(vecs.shape[0])]
+        db.save_embeddings(pairs)
+    search_mod.invalidate_cache(pid)
+
+
+def index_subtitle_text(pid, video_row_id, text, filename="subtitles.srt"):
+    """Index a user-provided subtitle file (.srt/.vtt) for ONE
+    episode. The episode counts as searchable only after its cues
+    are stored. Returns the number of segments indexed; raises
+    ValueError when the file yields no usable cues."""
+    from .vtt import parse_subtitles
+    segs = parse_subtitles(text, filename)
+    if not segs:
+        raise ValueError("Is file mein koi subtitle lines nahi "
+                         "mileen — sahi .srt ya .vtt file dein.")
+    db.add_segments(video_row_id, segs)
+    db.mark_transcript(video_row_id, True)
+    _index_embeddings_for_video(pid, video_row_id)
+    return len(segs)
 
 
 def run_playlist_job(jid: str, pid: str, url: str):
@@ -129,9 +223,9 @@ def run_playlist_job(jid: str, pid: str, url: str):
         # the user can start the same transcription from the UI, where it
         # runs in the background with progress.
         if os.environ.get("AUTO_TRANSCRIBE_MISSING") == "1":
-            n_whisper = transcribe_missing_episodes(pid, progress_fn=progress)
-            if n_whisper:
-                print(f"[ingest] whisper transcribed {n_whisper} videos")
+            rep = transcribe_missing_episodes(pid, progress_fn=progress)
+            if rep["done"]:
+                print(f"[ingest] whisper transcribed {rep['done']} videos")
         else:
             n_missing = sum(1 for v in db.get_videos(pid)
                             if not v["has_transcript"])
