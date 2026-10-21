@@ -108,6 +108,25 @@ def init_db():
         pcols = [r[1] for r in con.execute("PRAGMA table_info(playlists)")]
         if "source_id" not in pcols:
             con.execute("ALTER TABLE playlists ADD COLUMN source_id TEXT")
+        # migration: transcript provenance - every transcript keeps
+        # WHERE it came from in auditable detail: the caption track
+        # language or Whisper's detected language, the speech model
+        # name/version that produced it, Whisper's language
+        # probability, and when it was made. The cache key stays
+        # the stable video row; the provenance is what makes a
+        # stale-model transcript recognizable (and re-transcribable)
+        # instead of silently trusted forever.
+        for col, ddl in (
+                ("transcript_lang", "ALTER TABLE videos ADD COLUMN "
+                                    "transcript_lang TEXT"),
+                ("transcript_model", "ALTER TABLE videos ADD COLUMN "
+                                     "transcript_model TEXT"),
+                ("transcript_prob", "ALTER TABLE videos ADD COLUMN "
+                                    "transcript_prob REAL"),
+                ("transcript_at", "ALTER TABLE videos ADD COLUMN "
+                                  "transcript_at REAL")):
+            if col not in vcols:
+                con.execute(ddl)
         # backfill source_id for rows created before it existed
         for r in con.execute(
                 "SELECT id, url FROM playlists WHERE source_id IS NULL"
@@ -232,16 +251,30 @@ def get_video(vid):
         return dict(row) if row else None
 
 
-def mark_transcript(video_id, has, source=None):
+def mark_transcript(video_id, has, source=None, lang=None, model=None,
+                    prob=None):
+    """Record whether a video has a usable transcript, and - on
+    success - its provenance: source (captions/whisper/subtitle/
+    seed/upload), the caption or detected language, the speech
+    model that produced it, and the language probability. Marking
+    a video transcript-less clears the provenance with it, so stale
+    metadata can never describe a transcript that is not there."""
     with get_con() as con:
-        if source is not None:
-            con.execute("UPDATE videos SET has_transcript=?, "
-                        "transcript_source=? WHERE id=?",
-                        (1 if has else 0, source if has else None,
-                         video_id))
+        if has:
+            con.execute(
+                "UPDATE videos SET has_transcript=1, transcript_source=?, "
+                "transcript_lang=?, transcript_model=?, transcript_prob=?, "
+                "transcript_at=? WHERE id=?",
+                (source, lang, model, prob, time.time(), video_id))
+        elif source is not None or lang is not None or model is not None:
+            con.execute(
+                "UPDATE videos SET has_transcript=0, transcript_source=NULL, "
+                "transcript_lang=NULL, transcript_model=NULL, "
+                "transcript_prob=NULL, transcript_at=NULL WHERE id=?",
+                (video_id,))
         else:
-            con.execute("UPDATE videos SET has_transcript=? WHERE id=?",
-                        (1 if has else 0, video_id))
+            con.execute("UPDATE videos SET has_transcript=0 WHERE id=?",
+                        (video_id,))
 
 
 def playlist_stats(pid):
