@@ -251,6 +251,34 @@ def _visual_verify(upload_path, youtube_id, start, end):
                 "detail": f"Visual check fail: {type(e).__name__}: {e}"}
 
 
+def _alignment_verdict(score, matched_words):
+    """Evidence tier for a dialogue alignment. A similarity score
+    alone is never verification - the tier also demands enough
+    actually-matched words:
+
+      verified : score >= 0.55 and >= 10 matched words. Clean,
+                 extensive dialogue evidence for this specific clip
+                 and source segment.
+      probable : score >= 0.28 and >= 8 matched words. Real but
+                 imperfect evidence (e.g. a loose speech-to-text
+                 translation) - the right episode/scene is likely,
+                 but a human must confirm with the matched line.
+                 A very short clip can also reach probable - never
+                 verified - when almost all of its few words match
+                 (score >= 0.75 and >= 5 matched words): the phrase
+                 is distinctive, but there is too little material
+                 to verify an exact segment.
+      None     : below the probable floor. Merely similar - must
+                 NOT be presented as a match at all."""
+    if score >= 0.55 and matched_words >= 10:
+        return "verified"
+    if score >= 0.28 and matched_words >= 8:
+        return "probable"
+    if score >= 0.75 and matched_words >= 5:
+        return "probable"
+    return None
+
+
 def _clip_result(cand, clip_dur):
     v, a, score = cand["video"], cand["a"], cand["score"]
     start = float(a["offset"])
@@ -276,6 +304,7 @@ def _clip_result(cand, clip_dur):
         "url": v["url"], "url_at": watch_url_at(v["youtube_id"], start),
         "thumbnail": v.get("thumbnail"),
         "confidence": search_mod._confidence(score),
+        "verdict": _alignment_verdict(score, a["matched_words"]),
         "score": round(score, 3), "method": cand["method"],
         "reasons": reasons, "matched_lines": lines,
         "visual": {"status": "not_checked", "best_distance": None,
@@ -330,6 +359,7 @@ def _visual_only_scan(pid, upload_path, lang, prob, coverage):
     return {"ok": True, "language": lang, "language_probability": prob,
             "clip_transcript": "", "clip_transcript_en": None,
             "results": results, "coverage": coverage,
+            "verdict": "not_verified",
             "method": "visual-only scan (no speech in clip)",
             "note": ("Clip mein koi dialogue nahi mila — neeche sirf "
                      "visual hints hain, verified match nahi."
@@ -394,11 +424,25 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
     for segs in (segs_o, segs_en):
         if segs:
             clip_dur = max(clip_dur, segs[-1][1])
-    results = [_clip_result(c, clip_dur) for c in ranked[:3]]
+    # Evidence gating: an alignment below the probable floor is
+    # merely similar, not a match - it is suppressed entirely and
+    # the verdict becomes "not verified" instead of dressing the
+    # scene up as a weak candidate.
+    kept = [c for c in ranked
+            if _alignment_verdict(c["score"], c["a"]["matched_words"])]
+    verdict = None
+    if kept:
+        verdict = _alignment_verdict(kept[0]["score"],
+                                     kept[0]["a"]["matched_words"])
+    results = [_clip_result(c, clip_dur) for c in kept[:3]]
 
     if not results:  # semantic fallback with the clip's own words
         for q in (text_en, text_o):
-            if not q.strip():
+            if len(q.split()) < 12:
+                # Too little speech to be evidence: a handful of
+                # generic words can score deceptively high in
+                # keyword search (0.87 for "please come here right
+                # now okay") without identifying any scene.
                 continue
             sr = search_mod.search(pid, q, top_k=3)
             for r in sr.get("results", []):
@@ -416,9 +460,12 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
                               "nahi hua."})
                 results.append(r)
             if results:
+                # Semantic similarity alone can never verify an
+                # exact clip - at most it is a probable candidate.
+                verdict = "probable"
                 break
 
-    if results and ranked and visual_check:
+    if results and kept and visual_check:
         top = results[0]
         top["visual"] = _visual_verify(upload_path,
                                        top["youtube_id"],
@@ -428,6 +475,7 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
             "clip_transcript": text_o,
             "clip_transcript_en": text_en or None,
             "results": results, "coverage": coverage,
+            "verdict": verdict or "not_verified",
             "method": "clip transcription (original + translate) + "
                       "dialogue alignment",
             "note": None if results else
