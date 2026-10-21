@@ -252,7 +252,8 @@ for _k, _v in [("active_pid", None), ("ingest_jid", None),
                ("last_query", ""), ("last_results", None),
                ("fb_mode", None), ("run_search", False),
                ("submitted", None), ("results_pid", None),
-               ("analyze_error", None), ("visual_res", None)]:
+               ("analyze_error", None), ("visual_res", None),
+               ("tx_jid", None)]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
@@ -424,37 +425,103 @@ if _cov["total"]:
         st.caption(f"📊 Playlist coverage: tamam {_cov['total']} episodes "
                    "searchable (100%).")
 
-# ---- transcribe episodes that have no captions (runs on the server)
+# ---- episodes without captions: real fallbacks, honestly reported --
+# An episode counts as searchable ONLY when transcript segments are
+# actually indexed for it. For the rest, this panel offers three real
+# routes: (1) Whisper speech-to-text as a tracked background job with
+# progress and per-episode errors, (2) the user's own subtitle file
+# (.srt/.vtt) indexed for that episode, (3) a visual fallback -
+# real frames from across the episode to spot a scene by eye.
 _missing = [v for v in vids if not v.get("has_transcript")]
 if _missing:
-    _tx = st.session_state.get("tx_thread")
-    _tx_running = _tx is not None and _tx.is_alive()
+    st.warning(f"⚠️ {len(_missing)} episode(s) ke captions YouTube par "
+               "nahi hain — ye abhi search nahi ho sakte. Neeche har "
+               "episode ke liye asal tareeqe diye hain (Whisper "
+               "transcription, apni subtitle file, ya frames dekh kar "
+               "scene pehchanna).")
+    _tx_job = db.get_job(st.session_state.tx_jid) \
+        if st.session_state.get("tx_jid") else None
+    _tx_running = bool(_tx_job and _tx_job.get("status") == "running")
     if _tx_running:
-        st.info("🎙️ Episodes without captions are being transcribed in the "
-                "background… you can keep searching; newly transcribed "
-                "episodes become searchable automatically.")
-    else:
-        if _tx is not None:
-            st.session_state["tx_thread"] = None
-        st.warning(f"⚠️ {len(_missing)} episode(s) ke captions YouTube par "
-                   "nahi hain — ye abhi search nahi ho sakte.")
-        if st.button(f"🎙️ Transcribe {len(_missing)} episode(s) without captions",
-                     key="tx_btn",
-                     help="Uses AI transcription (Whisper) on the server so every episode becomes searchable. Takes a while; runs in the background."):
-            import threading
-            from backend import ingest as _ingest
-
-            def _run():
+        _cur = _tx_job.get("current") or 0
+        _tot = max(1, _tx_job.get("total") or 1)
+        st.progress(min(1.0, _cur / _tot),
+                    text=f"🎙️ Transcription chal rahi hai: "
+                         f"{_tx_job.get('stage') or ''} ({_cur}/{_tot})")
+        st.caption("Progress dekhne ke liye page refresh karein — "
+                   "kaam background mein chalta rehta hai, aur har "
+                   "episode usi waqt searchable banti hai jab us ka "
+                   "transcript index ho jata hai.")
+    elif _tx_job and _tx_job.get("status") == "done":
+        _rep = ingest.last_transcription_report(pid) or {}
+        st.success(f"🎙️ Transcription mukammal: "
+                   f"{_rep.get('done', 0)} episode(s) ke transcripts "
+                   "index ho gaye — wo ab searchable hain.")
+        for _f in _rep.get("failed", []):
+            st.error(f"❌ {_f.get('title')}: {_f.get('error')}")
+    elif _tx_job and _tx_job.get("status") == "error":
+        st.error(f"🎙️ Transcription ruk gayi: {_tx_job.get('error')}")
+    st.caption(
+        "⏱️ Resource note: Whisper is app ke free server par chalta "
+        "hai — koi API key ya paisa nahi chahiye, lekin slow hai: aik "
+        "35–40 minute ki episode ko takreeban utna hi waqt lag sakta "
+        "hai, aur app ka awake rehna zaroori hai. Is liye pehle wohi "
+        "episodes transcribe karein jin ki sab se zyada zaroorat hai; "
+        "baqi baad mein. Subtitle file wala tareeqa sab se tez hai "
+        "agar aap ke paas .srt/.vtt maujood ho.")
+    if st.button(f"🎙️ Sab {len(_missing)} missing episodes transcribe "
+                 "karein (background job)",
+                 key="tx_all_btn", disabled=_tx_running):
+        st.session_state.tx_jid = ingest.start_transcription_job(pid)
+        st.rerun()
+    with st.expander(f"📋 Har missing episode ke options "
+                     f"({len(_missing)})"):
+        for v in _missing:
+            st.markdown(f"**Episode {v['position']} — {v['title']}**")
+            if st.button("🎙️ Sirf ye episode transcribe karein",
+                         key=f"tx_one_{v['id']}", disabled=_tx_running):
+                st.session_state.tx_jid = ingest.start_transcription_job(
+                    pid, video_ids={v["id"]})
+                st.rerun()
+            _sub = st.file_uploader(
+                "📄 Apni subtitle file dein (.srt / .vtt) — ye episode "
+                "foran searchable ho jayegi",
+                type=["srt", "vtt"], key=f"sub_up_{v['id']}")
+            if _sub is not None and st.button(
+                    "📄 Ye subtitles index karein",
+                    key=f"sub_btn_{v['id']}"):
                 try:
-                    n = _ingest.transcribe_missing_episodes(pid)
-                    print(f"[app] background transcription done: {n} episodes")
+                    _text = _sub.getvalue().decode("utf-8",
+                                                    errors="ignore")
+                    _n = ingest.index_subtitle_text(
+                        pid, v["id"], _text, _sub.name)
+                    st.success(f"✅ {_n} subtitle lines index ho "
+                               f"gayin — Episode {v['position']} ab "
+                               "searchable hai!")
                 except Exception as e:
-                    print(f"[app] background transcription failed: {e}")
-
-            th = threading.Thread(target=_run, daemon=True)
-            st.session_state["tx_thread"] = th
-            th.start()
-            st.success("✅ Transcription started in the background! You can keep using the site.")
+                    st.error(f"Subtitles index nahi hueen: {e}")
+            with st.expander(f"🖼️ Episode {v['position']} ke frames — "
+                             "visual fallback"):
+                st.caption("Transcript ke baghair bhi, episode ke "
+                           "mukhtalif hisson ke asal frames dekh kar "
+                           "scene pehchana ja sakta hai aur us ki "
+                           "taqreeban timing note ki ja sakti hai.")
+                if st.button("Frames load karein",
+                             key=f"frames_{v['id']}"):
+                    with st.spinner("Storyboard frames la raha hoon…"):
+                        st.session_state[f"ep_frames_{v['id']}"] = \
+                            visual_mod.episode_frames(v["youtube_id"])
+                _ef = st.session_state.get(f"ep_frames_{v['id']}")
+                if _ef:
+                    if _ef.get("available"):
+                        _cols = st.columns(4)
+                        for _i, _fr in enumerate(_ef["frames"]):
+                            _cols[_i % 4].image(
+                                _fr["path"], caption=f"⏱ {_fr['hms']}")
+                    else:
+                        st.info("Frames available nahi: "
+                                + str(_ef.get("reason")))
+            st.divider()
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
