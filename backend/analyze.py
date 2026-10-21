@@ -192,12 +192,27 @@ def analyze_clip(pid, upload_path: Path):
 
 
 # ------------------------------------------------- universal clip finder
-def _whisper_transcribe(path, task="transcribe"):
+_NAMED_MODELS = {}
+
+
+def _whisper_named(name):
+    """A Whisper model loaded by name (separate from the configured
+    default). Used by the clip rescue path, which re-transcribes a
+    failed clip with the stronger 'small' model."""
+    if name not in _NAMED_MODELS:
+        from faster_whisper import WhisperModel
+        _NAMED_MODELS[name] = WhisperModel(name, device="cpu",
+                                           compute_type="int8")
+        print(f"[analyze] whisper model '{name}' loaded (named)")
+    return _NAMED_MODELS[name]
+
+
+def _whisper_transcribe(path, task="transcribe", model_name=None):
     """(segments, language, language_probability) for a media file.
     Language is auto-detected by Whisper; the original-language text
     is preserved (task='transcribe'). task='translate' renders the
     same speech in English."""
-    model = _whisper()
+    model = _whisper_named(model_name) if model_name else _whisper()
     try:
         segments, info = model.transcribe(str(path), beam_size=5, task=task, **_DECODE_KW)
     except TypeError:
@@ -292,6 +307,230 @@ def _diversity(text):
     if len(toks) < 20:
         return None
     return round(len(set(toks)) / len(toks), 3)
+
+
+def _repeated_ngram_coverage(text, n=4):
+    """Share of a text's n-gram positions whose n-gram occurs at
+    least twice - i.e. how much of the text is repeated material.
+    Natural dialogue repeats almost no 4-word sequence; a
+    formulaic transcript (a religious formula or song line
+    recited over and over) is mostly repetition."""
+    toks = text.split()
+    if len(toks) < n + 4:
+        return 0.0
+    from collections import Counter
+    grams = Counter(tuple(toks[i:i + n])
+                    for i in range(len(toks) - n + 1))
+    total = sum(grams.values())
+    repeated = sum(c for c in grams.values() if c >= 2)
+    return repeated / max(1, total)
+
+
+def _pass_is_weak(text):
+    """A transcription pass that cannot carry scene evidence:
+    either a long repetition loop (diversity collapse) or a
+    formulaic text dominated by one repeated phrase. Measured
+    (2026-10-21): a wailing/death clip's translate pass was 29
+    words - "I swear to God, there is no god but God" twice plus
+    "I love you, my son" - diverse by ratio (0.52) yet pure
+    formula; it aligned 'probable' into its own episode and
+    semantically into an UNRELATED drama, because such phrases
+    occur in countless scenes. Weak passes are excluded from
+    matching; the rescue path (chunked, per-segment) is where
+    noisy-but-real speech gets its chance instead."""
+    if len(text.split()) < 15:
+        return False
+    div = _diversity(text)
+    if div is not None and div < 0.15:
+        return True
+    return _repeated_ngram_coverage(text) >= 0.5
+
+
+def _collapse_loops(text, run=6, keep=2):
+    """Collapse long same-token runs (Whisper repetition artifacts)
+    in an alignment QUERY: a run of >= `run` identical tokens keeps
+    `keep` copies. The real words around the artifact survive; the
+    poison that dilutes sequence alignment is removed. (Measured:
+    one real clip's transcript went from 126 tokens - over half a
+    single repeated token - to 55 real words.) Display transcripts
+    are never altered; this only cleans matching queries."""
+    toks = text.split()
+    out, i = [], 0
+    while i < len(toks):
+        j = i
+        while j < len(toks) and toks[j] == toks[i]:
+            j += 1
+        out.extend([toks[i]] * (keep if j - i >= run else j - i))
+        i = j
+    return " ".join(out)
+
+
+def _rescue_alignment(esc_segs, pairs, clip_dur):
+    """Chunked, script-bridged alignment - the rescue path for a
+    clip whose primary transcription produced no match.
+
+    Why it exists (measured on a real user's clip, 2026-10-21): the
+    episode captions were Hindi auto-captions in Devanagari script;
+    the clip model heard the Urdu dialogue in Urdu script at 57%
+    confidence, full of errors and a repetition chunk - whole-text
+    token alignment found literally nothing in ANY script space.
+    A stronger model heard the same dialogue largely in Devanagari,
+    but code-switched (half English), so whole-text alignment still
+    diluted below the floor. What worked: aligning the clip in
+    PIECES (per segment + the non-Latin chunk), with both sides
+    transliterated into a common Latin space, and letting two
+    INDEPENDENT pieces of the clip corroborate one scene.
+
+    Verdict discipline is unchanged: a single chunk must meet the
+    normal _alignment_verdict floors; otherwise at least two
+    distinct clip segments must independently match the same
+    episode within 120s, with >= 10 matched words in total and the
+    strongest chunk >= 0.35 - and that aggregation is capped at
+    probable. Returns (result, verdict, info) or None."""
+    from . import normalize as norm_mod
+    lat_pairs = [(v, [{"start": s["start"], "end": s["end"],
+                       "text": norm_mod.transliterate(s["text"])}
+                      for s in segs]) for v, segs in pairs]
+    queries, seen = [], set()
+
+    def _add_q(text, space, label, src=None):
+        t = (text or "").strip()
+        if len(t.split()) < 4 or t in seen:
+            return
+        seen.add(t)
+        queries.append((t, space, label, src))
+
+    full_raw = " ".join(t for _, _, t in esc_segs)
+    _add_q(_collapse_loops(norm_mod.transliterate(full_raw)),
+           "lat", "full (script-bridged)")
+    _add_q(_collapse_loops(full_raw), "raw", "full")
+    nonlatin = []
+    for idx, (_a, _b, t) in enumerate(esc_segs):
+        if sum(1 for ch in t if ord(ch) > 0x2500) >= 4:
+            nonlatin.append(t)
+        _add_q(norm_mod.transliterate(t), "lat",
+               "segment (script-bridged)", src=idx)
+        _add_q(t, "raw", "segment", src=idx)
+    if nonlatin:
+        _add_q(_collapse_loops(norm_mod.transliterate(
+            " ".join(nonlatin))), "lat", "non-Latin chunk "
+            "(script-bridged)")
+    groups = {}
+    for text, space, label, src in queries:
+        space_pairs = lat_pairs if space == "lat" else pairs
+        for s, v, a in align_against_playlist(text, space_pairs):
+            groups.setdefault(v["id"], []).append(
+                {"score": s, "video": v, "a": a, "method": label,
+                 "src": src, "qtext": text})
+    best = None
+    for _vid, cands in groups.items():
+        cands.sort(key=lambda c: c["a"]["offset"])
+        for i in range(len(cands)):
+            cluster = [c for c in cands
+                       if 0 <= c["a"]["offset"] - cands[i]["a"]["offset"]
+                       <= 120]
+            by_src = {}
+            for c in cluster:
+                if c["src"] is not None and (
+                        c["src"] not in by_src or
+                        c["score"] > by_src[c["src"]]["score"]):
+                    by_src[c["src"]] = c
+            distinct = list(by_src.values())
+            total_m = sum(c["a"]["matched_words"] for c in distinct)
+            # EVERY chunk gets its own verdict check - the
+            # highest-scoring chunk is not always the one that
+            # meets a floor (a wide chunk can qualify on matched
+            # words at a lower score).
+            v_single, single = None, None
+            for c in cluster:
+                v = _alignment_verdict(c["score"],
+                                        c["a"]["matched_words"])
+                if v == "verified" or (v and not v_single):
+                    v_single, single = v, c
+                if v == "verified":
+                    break
+            if single is None:
+                single = max(cluster, key=lambda c: c["score"])
+            agg = (len(distinct) >= 2 and total_m >= 10
+                   and single["score"] >= 0.35)
+            if not v_single and not agg:
+                continue
+            verdict = v_single or "probable"
+            rank = (1 if v_single else 0, total_m, single["score"])
+            if best is None or rank > best[0]:
+                top = max(cluster, key=lambda c: (
+                    c["a"]["matched_words"], c["score"]))
+                best = (rank, top, verdict, cluster, distinct)
+    if best is None:
+        return None
+    _rank, top, verdict, cluster, distinct = best
+    cand = {"score": top["score"], "video": top["video"],
+            "a": top["a"],
+            "method": "dialogue alignment (rescue: chunked + "
+                      "script bridge)"}
+    r = _clip_result(cand, clip_dur)
+    r["reasons"].append(
+        "Ye match rescue tajziye se mila: clip ke dialogue ko "
+        "hisson mein, aur episode captions ko clip ki script se "
+        "aam Latin script mein badal kar (script bridge) milaya "
+        f"gaya — {len(distinct)} aazad hisse aik hi scene ki taraf "
+        "ishara karte hain.")
+    for c in sorted(cluster, key=lambda c: -c["score"])[:3]:
+        r["reasons"].append(
+            f"Chunk saboot: score {c['score']:.2f}, "
+            f"{c['a']['matched_words']} alfaaz @ "
+            f"{int(c['a']['offset'])}s ({c['method']}).")
+    # Timestamp fine-tune (episode choice UNCHANGED): each matched
+    # clip segment is an anchor - we know where that segment sits
+    # inside the clip AND where its matched words sit in the
+    # episode, so each anchor implies where the clip's 0s lands in
+    # the episode. The median implied start replaces the raw
+    # anchor-line offset, and the transcript scene range is
+    # clamped to a small margin around the clip's own window -
+    # the caption-block estimate alone overshot the true scene
+    # start by ~74s on the measured Wehshi case (block widening
+    # runs into the previous conversation), while the anchors are
+    # the clip's own evidence.
+    implied = []
+    for c in distinct:
+        cs, ce, _t = esc_segs[c["src"]]
+        n_words = max(1, len(c["qtext"].split()))
+        anchor_clip_t = cs + (c["a"].get("clip_anchor", 0)
+                              / n_words) * max(0.1, ce - cs)
+        implied.append(c["a"]["offset"] - anchor_clip_t)
+    info_extra = {}
+    if implied:
+        implied.sort()
+        t0 = implied[len(implied) // 2]
+        if 0 <= t0 and abs(t0 - top["a"]["offset"]) <= clip_dur + 120:
+            r["match_start"] = round(t0, 1)
+            r["match_end"] = round(t0 + clip_dur, 1)
+            r["match_start_hms"] = format_hms(t0)
+            r["match_end_hms"] = format_hms(t0 + clip_dur)
+            r["timestamp"] = round(t0, 1)
+            r["timestamp_hms"] = format_hms(t0)
+            r["url_at"] = watch_url_at(r["youtube_id"], t0)
+            lo, hi = t0 - 20, t0 + clip_dur + 20
+            if r["scene_start"] < lo:
+                r["scene_start"] = round(lo, 1)
+                r["scene_start_hms"] = format_hms(lo)
+            if r["scene_end"] > hi:
+                r["scene_end"] = round(hi, 1)
+                r["scene_end_hms"] = format_hms(hi)
+            r["reasons"].append(
+                "Timestamp anchor hisaab se theek kiya gaya: clip "
+                f"ke {len(implied)} hisse episode ki timing se "
+                f"mile — clip episode ke {format_hms(t0)} se "
+                "shuru hota hai.")
+            info_extra = {"timestamp_anchors": len(implied),
+                          "clip_start_in_episode": round(t0, 1)}
+    info = {"queries": len(queries),
+            "cluster_chunks": len(cluster),
+            "distinct_segments": len(distinct),
+            "cluster_matched_words": sum(
+                c["a"]["matched_words"] for c in distinct),
+            **info_extra}
+    return r, verdict, info
 
 
 def _probe_duration(path):
@@ -552,7 +791,7 @@ def _visual_only_scan(pid, upload_path, lang, prob, coverage):
 
 
 def analyze_clip_full(pid, upload_path, transcribe_fn=None,
-                      visual_check=True):
+                      visual_check=True, escalate_fn=None):
     """Universal clip pipeline (any drama, any language):
 
     1. Transcribe the clip in its ORIGINAL language (auto-detected)
@@ -647,10 +886,14 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
         if cur is None or score > cur["score"]:
             cand[video["id"]] = {"score": score, "video": video,
                                  "a": a, "method": method}
-    if text_o.strip():
+    weak_o, weak_en = _pass_is_weak(text_o), _pass_is_weak(text_en)
+    if weak_o or weak_en:
+        diag["weak_passes"] = (["original"] if weak_o else []) + \
+                              (["english"] if weak_en else [])
+    if text_o.strip() and not weak_o:
         for s, v, a in align_against_playlist(text_o, pairs):
             _add(s, v, a, "dialogue alignment (original language)")
-    if text_en.strip():
+    if text_en.strip() and not weak_en:
         for s, v, a in align_against_playlist(text_en, pairs):
             _add(s, v, a, "dialogue alignment (translated to English)")
     ranked = sorted(cand.values(), key=lambda c: c["score"],
@@ -709,6 +952,37 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
                 results = [r]
                 verdict = "probable"
 
+    # Rescue path: when the primary transcription produced NO
+    # result at all, re-transcribe once with a stronger model and
+    # retry with chunked, script-bridged alignment (see
+    # _rescue_alignment for the measured failure this answers). The
+    # escalated transcript must pass the same diversity gate - a
+    # loop is not evidence at any model size.
+    rescue_info = None
+    if not results:
+        efn = escalate_fn
+        if efn is None and transcribe_fn is None:
+            def efn(p, task="transcribe"):
+                return _whisper_transcribe(p, task=task,
+                                           model_name="small")
+        if efn is not None:
+            diag["rescue_attempted"] = True
+            try:
+                esc_segs, _el, _ep = efn(upload_path,
+                                         task="transcribe")
+            except Exception:
+                esc_segs = []
+            if esc_segs:
+                esc_text = " ".join(t for _, _, t in esc_segs)
+                _div = _diversity(esc_text)
+                if (_div is None or _div >= 0.15) and \
+                        not _pass_is_weak(esc_text):
+                    got = _rescue_alignment(esc_segs, pairs, clip_dur)
+                    if got:
+                        _r, verdict, rescue_info = got
+                        results = [_r]
+                        diag["rescue"] = rescue_info
+
     if not results:  # semantic fallback with the clip's own words
         for q in (text_en, text_o):
             if len(q.split()) < 12:
@@ -716,6 +990,11 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
                 # generic words can score deceptively high in
                 # keyword search (0.87 for "please come here right
                 # now okay") without identifying any scene.
+                continue
+            if _pass_is_weak(q):
+                # A formulaic / loop query ("I swear to God..."
+                # repeated) embeds close to countless scenes -
+                # it is not scene evidence.
                 continue
             sr = search_mod.search(pid, q, top_k=3)
             for r in sr.get("results", []):
@@ -739,6 +1018,18 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
                     diag.setdefault("semantic_rejected", []).append(
                         {"title": r.get("title"),
                          "reason": "clip has no distinctive terms"})
+                    continue
+                if len(_dist) < 5:
+                    # Too little identifying material of its own:
+                    # with fewer than 5 distinctive terms, generic
+                    # vocabulary alone decides the "coverage" -
+                    # measured FP: a formulaic clip carried only 4
+                    # real terms (swear/god/love/son) and passed at
+                    # 5/7 before hygiene shrank the list.
+                    diag.setdefault("semantic_rejected", []).append(
+                        {"title": r.get("title"),
+                         "reason": "too few distinctive terms",
+                         "distinctive_total": len(_dist)})
                     continue
                 _covf, _hits = search_mod.coverage_factor(
                     _dist, search_mod._scene_text(r["video_id"],
@@ -765,7 +1056,8 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
     _top_real_visual = bool(results) and \
         results[0].get("visual", {}).get("status") in ("similar",
                                                        "different")
-    if results and visual_check and (kept or _top_real_visual):
+    if results and visual_check and (kept or rescue_info or
+                                     _top_real_visual):
         top = results[0]
         if top.get("visual", {}).get("status") in (None, "not_checked"):
             top["visual"] = _visual_verify(upload_path,

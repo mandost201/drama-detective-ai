@@ -97,13 +97,20 @@ def fuzzy_align(clip_words, video_words, video_times):
     # words occur (the longest run can sit mid-scene and pull the
     # timestamp late, e.g. +12s on a real Urdu clip).
     threshold = max(3, biggest.size // 2)
-    first_big = min((b for b in blocks if b.size >= threshold),
-                    key=lambda b: b.b)
+    _substantial = [b for b in blocks if b.size >= threshold]
+    # When every matching block is short (fragmented matches across
+    # two noisy transcripts), no block reaches the threshold and
+    # min() on the empty set crashed the whole clip search
+    # (found 2026-10-21 against a real clip). Fall back to the
+    # biggest block itself - it is the strongest anchor available.
+    first_big = min(_substantial, key=lambda b: b.b) \
+        if _substantial else biggest
     offset = video_times[best_i + first_big.b]
     span = min(W, 30)
     return {
         "score": best_score,
         "offset": offset,
+        "clip_anchor": first_big.a,
         "matched_words": len(matched_words),
         "clip_words": W,
         "coverage": best_score,

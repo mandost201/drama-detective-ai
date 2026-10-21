@@ -235,6 +235,41 @@ def _transcribe_upload(vpath, task="transcribe"):
     segs, _lang, _prob = _transcribe_upload_info(vpath, task=task)
     return segs
 
+
+def _transcribe_upload_info_small(vpath, task="transcribe"):
+    """Escalation transcription with the SMALL model - loaded only
+    for this call and freed afterwards (free-tier RAM cannot hold
+    two models). Used solely when the base-model clip pipeline
+    found no match: a stronger hearing plus the backend's chunked,
+    script-bridged rescue alignment gets one more, honest chance."""
+    from faster_whisper import WhisperModel
+    model = WhisperModel("small", device="cpu", compute_type="int8")
+    try:
+        kw = dict(beam_size=5, task=task, temperature=0.0,
+                  condition_on_previous_text=False)
+        try:
+            segments, info = model.transcribe(str(vpath), **kw)
+        except TypeError:
+            import av
+            _orig = av.open
+
+            def _patched(*a, **k):
+                k.pop("metadata_errors", None)
+                return _orig(*a, **k)
+            av.open = _patched
+            try:
+                segments, info = model.transcribe(str(vpath), **kw)
+            finally:
+                av.open = _orig
+        segs = [(round(s.start, 1), round(s.end, 1), s.text.strip())
+                for s in segments if s.text.strip()]
+        return segs, getattr(info, "language", None), \
+            getattr(info, "language_probability", None)
+    finally:
+        del model
+        import gc
+        gc.collect()
+
 def _is_upload_video(r):
     return str(r.get("youtube_id") or "").startswith("upload-")
 
@@ -965,7 +1000,8 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
             def _tf(path, task="transcribe"):
                 return _transcribe_upload_info(path, task=task)
             clip_res = analyze_mod.analyze_clip_full(
-                pid, cpath, transcribe_fn=_tf)
+                pid, cpath, transcribe_fn=_tf,
+                escalate_fn=_transcribe_upload_info_small)
     except Exception as e:
         st.error(f"Could not analyze the clip: {e}")
         st.stop()

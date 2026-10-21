@@ -36,6 +36,8 @@ scene scenes seen episode episodes moment moments part parts clip video
 where when what which who whom whose how this that these those there here
 no will would can could shall should may might must for your yours you we
 it its his her their them he she him do does did
+my so but too used say said till also just very much many more most not
+nor once again over under own same get got
 the a an in on of to and or is are was were be been has have had
 ki ka ke ko se ne mein me main hai hain tha thi they thay
 wala wale wali yeh ye woh wo ek aik aur lekin par per bhi
