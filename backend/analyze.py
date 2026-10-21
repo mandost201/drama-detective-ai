@@ -148,6 +148,292 @@ def analyze_clip(pid, upload_path: Path):
             "note": None}
 
 
+# ------------------------------------------------- universal clip finder
+def _whisper_transcribe(path, task="transcribe"):
+    """(segments, language, language_probability) for a media file.
+    Language is auto-detected by Whisper; the original-language text
+    is preserved (task='transcribe'). task='translate' renders the
+    same speech in English."""
+    model = _whisper()
+    try:
+        segments, info = model.transcribe(str(path), beam_size=5, task=task)
+    except TypeError:
+        import av
+        _orig = av.open
+
+        def _patched(*a, **k):
+            k.pop("metadata_errors", None)
+            return _orig(*a, **k)
+        av.open = _patched
+        try:
+            segments, info = model.transcribe(str(path), beam_size=5,
+                                              task=task)
+        finally:
+            av.open = _orig
+    segs = [(round(s.start, 1), round(s.end, 1), s.text.strip())
+            for s in segments if s.text.strip()]
+    return segs, getattr(info, "language", None), \
+        getattr(info, "language_probability", None)
+
+
+def _clip_frames(path, count=3):
+    """Extract up to `count` frames from a clip with PyAV (works
+    where ffmpeg is unavailable, e.g. Streamlit Cloud). Returns a
+    list of PIL Images; empty on any failure."""
+    try:
+        import av
+        from PIL import Image  # noqa: F401  (ensures PIL present)
+        frames = []
+        with av.open(str(path)) as container:
+            if not container.streams.video:
+                return []
+            stream = container.streams.video[0]
+            total = (container.duration or 0) / 1e6
+            fracs = [0.15, 0.5, 0.85][:count]
+            want = [total * f for f in fracs] if total else []
+            for frame in container.decode(stream):
+                t = frame.time or 0.0
+                if want and len(frames) < len(want) and t >= want[len(frames)]:
+                    frames.append(frame.to_image())
+                if len(frames) >= count:
+                    break
+            if not frames:  # duration unknown: take the first frame
+                for frame in container.decode(stream):
+                    frames.append(frame.to_image())
+                    break
+        return frames
+    except Exception as e:
+        print(f"[analyze] clip frame extraction failed: {e}")
+        return []
+
+
+def _visual_compare(clip_hashes, frames_result):
+    """Compare clip frame hashes against a visual.scene_frames /
+    episode_frames result. Coarse supporting signal ONLY: storyboard
+    previews are sparse, low-res seek images, so 'similar' supports
+    a dialogue match but never proves one by itself."""
+    if not clip_hashes:
+        return {"status": "unavailable", "best_distance": None,
+                "detail": "Clip se frames nahi nikal sake."}
+    if not frames_result or not frames_result.get("available"):
+        reason = (frames_result or {}).get(
+            "reason", "Storyboard frames available nahi.")
+        return {"status": "unavailable", "best_distance": None,
+                "detail": f"Source frames available nahi: {reason}"}
+    from PIL import Image
+    cand = []
+    for f in frames_result["frames"]:
+        try:
+            cand.append(_dhash(Image.open(f["path"])))
+        except Exception:
+            continue
+    if not cand:
+        return {"status": "unavailable", "best_distance": None,
+                "detail": "Source frames parhi nahi ja sakeen."}
+    best = min(_hamming(ch, vh) for ch in clip_hashes for vh in cand)
+    # dHash is 64-bit: <=10 near-identical, <=18 similar-looking
+    status = "similar" if best <= 18 else "different"
+    return {"status": status, "best_distance": best,
+            "detail": f"Qareeb tareen frame distance {best}/64 "
+                      "(storyboard previews sparse hote hain — ye "
+                      "sirf supporting signal hai, saboot nahi)."}
+
+
+def _visual_verify(upload_path, youtube_id, start, end):
+    """Frame-check one dialogue candidate against its source video."""
+    try:
+        from . import visual as visual_mod
+        hashes = [_dhash(im) for im in _clip_frames(upload_path)]
+        frames = visual_mod.scene_frames(youtube_id, start, end)
+        return _visual_compare(hashes, frames)
+    except Exception as e:
+        return {"status": "unavailable", "best_distance": None,
+                "detail": f"Visual check fail: {type(e).__name__}: {e}"}
+
+
+def _clip_result(cand, clip_dur):
+    v, a, score = cand["video"], cand["a"], cand["score"]
+    start = float(a["offset"])
+    end = start + max(2.0, clip_dur)
+    lines = search_mod._nearby_lines(v["id"], start)
+    reasons = [
+        f"Clip dialogue matched {a['matched_words']} words "
+        f"({a['coverage'] * 100:.0f}% of the clip's speech) — "
+        f"{cand['method']}.",
+        f"Matched line: \"{a['matched_text'][:140]}\"",
+    ]
+    if a["coverage"] < 0.6:
+        reasons.append(
+            "Clip ka sirf aik hissa match hua — clip edited/montage "
+            "ho sakta hai; diya gaya time usi matched hisse ka hai.")
+    return {
+        "video_id": v["id"], "youtube_id": v["youtube_id"],
+        "title": v["title"], "episode": v["position"],
+        "timestamp": round(start, 1), "timestamp_hms": format_hms(start),
+        "scene_start": round(start, 1), "scene_end": round(end, 1),
+        "scene_start_hms": format_hms(start),
+        "scene_end_hms": format_hms(end),
+        "url": v["url"], "url_at": watch_url_at(v["youtube_id"], start),
+        "thumbnail": v.get("thumbnail"),
+        "confidence": search_mod._confidence(score),
+        "score": round(score, 3), "method": cand["method"],
+        "reasons": reasons, "matched_lines": lines,
+        "visual": {"status": "not_checked", "best_distance": None,
+                   "detail": "Sirf top candidate ki frames check "
+                             "hoti hain."},
+    }
+
+
+def _visual_only_scan(pid, upload_path, lang, prob, coverage):
+    """A clip with no detectable speech: rank episodes by frame
+    similarity against their storyboard previews. These are HINTS
+    at low confidence - never verified matches."""
+    hashes = [_dhash(im) for im in _clip_frames(upload_path)]
+    if not hashes:
+        return {"ok": False,
+                "error": "Clip mein na dialogue mila na frames nikal "
+                         "sake — is clip ko match nahi kiya ja sakta. "
+                         "Scene ko alfaz mein describe karke try "
+                         "karein (Step 2)."}
+    from . import visual as visual_mod
+    scored = []
+    for v in db.get_videos(pid)[:40]:  # bounded: storyboard downloads
+        ef = visual_mod.episode_frames(v["youtube_id"], count=6)
+        if not ef.get("available"):
+            continue
+        cmp = _visual_compare(hashes, ef)
+        if cmp.get("best_distance") is not None:
+            scored.append((cmp["best_distance"], v, cmp))
+    scored.sort(key=lambda t: t[0])
+    results = []
+    for dist, v, cmp in scored[:3]:
+        if dist > 22:  # too different to even hint at
+            continue
+        results.append({
+            "video_id": v["id"], "youtube_id": v["youtube_id"],
+            "title": v["title"], "episode": v["position"],
+            "timestamp": 0.0, "timestamp_hms": "00:00:00",
+            "scene_start": 0.0, "scene_end": 0.0,
+            "scene_start_hms": "00:00:00", "scene_end_hms": "00:00:00",
+            "url": v["url"], "url_at": v["url"],
+            "thumbnail": v.get("thumbnail"),
+            "confidence": "low",
+            "score": round(max(0.0, 1 - dist / 24) * 0.5, 3),
+            "method": "visual frame similarity (storyboard previews)",
+            "reasons": [
+                f"Clip ke frames is episode ke storyboard frames se "
+                f"kuch miltay jultay hain (distance {dist}/64).",
+                "Ye sirf aik HINT hai — dialogue saboot ke baghair "
+                "ye verified match NAHI hai."],
+            "matched_lines": [], "visual": cmp,
+        })
+    return {"ok": True, "language": lang, "language_probability": prob,
+            "clip_transcript": "", "clip_transcript_en": None,
+            "results": results, "coverage": coverage,
+            "method": "visual-only scan (no speech in clip)",
+            "note": ("Clip mein koi dialogue nahi mila — neeche sirf "
+                     "visual hints hain, verified match nahi."
+                     if results else
+                     "No verified match in this playlist.")}
+
+
+def analyze_clip_full(pid, upload_path, transcribe_fn=None,
+                      visual_check=True):
+    """Universal clip pipeline (any drama, any language):
+
+    1. Transcribe the clip in its ORIGINAL language (auto-detected)
+       and, when it isn't English, also translate it to English.
+    2. Align BOTH texts against every indexed episode of THIS
+       playlist only (Unicode-aware word alignment), then fall back
+       to semantic search with the clip text.
+    3. Visually verify the top dialogue candidate against real
+       storyboard frames of its source video (separate status).
+    4. A speech-less clip goes to a bounded visual-only scan whose
+       results are labelled hints, never verified matches.
+    Unindexed episodes are never pretended to be searched - the
+    returned coverage says exactly how many were."""
+    tf = transcribe_fn or _whisper_transcribe
+    try:
+        segs_o, lang, prob = tf(upload_path, task="transcribe")
+    except Exception as e:
+        return {"ok": False,
+                "error": f"Could not transcribe the clip: {e}"}
+    text_o = " ".join(t for _, _, t in segs_o)
+    text_en, segs_en = "", []
+    if lang and lang != "en" and text_o.strip():
+        try:
+            segs_en, _l, _p = tf(upload_path, task="translate")
+            text_en = " ".join(t for _, _, t in segs_en)
+        except Exception:
+            segs_en, text_en = [], ""
+    coverage = search_mod.playlist_coverage(pid)
+    if not text_o.strip() and not text_en.strip():
+        return _visual_only_scan(pid, upload_path, lang, prob, coverage)
+
+    pairs = []
+    for v in db.get_videos(pid):
+        segs = db.get_segments(v["id"])
+        if segs:
+            pairs.append((v, segs))
+    cand = {}
+
+    def _add(score, video, a, method):
+        cur = cand.get(video["id"])
+        if cur is None or score > cur["score"]:
+            cand[video["id"]] = {"score": score, "video": video,
+                                 "a": a, "method": method}
+    if text_o.strip():
+        for s, v, a in align_against_playlist(text_o, pairs):
+            _add(s, v, a, "dialogue alignment (original language)")
+    if text_en.strip():
+        for s, v, a in align_against_playlist(text_en, pairs):
+            _add(s, v, a, "dialogue alignment (translated to English)")
+    ranked = sorted(cand.values(), key=lambda c: c["score"],
+                    reverse=True)
+    clip_dur = 0.0
+    for segs in (segs_o, segs_en):
+        if segs:
+            clip_dur = max(clip_dur, segs[-1][1])
+    results = [_clip_result(c, clip_dur) for c in ranked[:3]]
+
+    if not results:  # semantic fallback with the clip's own words
+        for q in (text_en, text_o):
+            if not q.strip():
+                continue
+            sr = search_mod.search(pid, q, top_k=3)
+            for r in sr.get("results", []):
+                # A clip transcript is a long, specific query: a weak
+                # keyword/semantic hit on it is noise, not a
+                # candidate. Only medium-or-better evidence is
+                # promoted; anything less stays "no verified match".
+                if (r.get("score") or 0) < 0.5:
+                    continue
+                r = dict(r)
+                r["method"] = "semantic search (clip transcript)"
+                r.setdefault("visual", {
+                    "status": "not_checked", "best_distance": None,
+                    "detail": "Semantic candidate — frames check "
+                              "nahi hua."})
+                results.append(r)
+            if results:
+                break
+
+    if results and ranked and visual_check:
+        top = results[0]
+        top["visual"] = _visual_verify(upload_path,
+                                       top["youtube_id"],
+                                       top["scene_start"],
+                                       top["scene_end"])
+    return {"ok": True, "language": lang, "language_probability": prob,
+            "clip_transcript": text_o,
+            "clip_transcript_en": text_en or None,
+            "results": results, "coverage": coverage,
+            "method": "clip transcription (original + translate) + "
+                      "dialogue alignment",
+            "note": None if results else
+                    "No verified match in this playlist."}
+
+
 # ---------------------------------------------------------- screenshots
 def _dhash(img, size=9):
     from PIL import Image

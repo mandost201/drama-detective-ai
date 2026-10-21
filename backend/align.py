@@ -4,11 +4,17 @@ Finds where the clip's spoken words occur in the video, returning the video
 timestamp and a score. Uses fuzzy window matching (difflib matching blocks),
 so imperfect speech-to-text still matches - exact contiguous runs score
 highest, scattered word overlap scores lower. Pure stdlib, fast.
+
+Word tokenization is Unicode-aware: dialogue in Urdu, Arabic, Hindi,
+Turkish, Korean, Chinese etc. scripts tokenizes into words, not into
+nothing (the original [a-z0-9] pattern silently erased every
+non-Latin script, which made original-language matching impossible
+for most of the world's dramas).
 """
 import re
 from difflib import SequenceMatcher
 
-WORD = re.compile(r"[a-z0-9']+")
+WORD = re.compile(r"[^\W_]+(?:'[^\W_]+)?", re.UNICODE)
 
 STOPWORDS = frozenset("""
 a an the and or but if then so of at by for with to in on as it its it's is are
@@ -86,7 +92,14 @@ def fuzzy_align(clip_words, video_words, video_times):
     if len(matched_words) < 3 or len(content_words(matched_words)) < 2:
         return None
     biggest = max(blocks, key=lambda b: b.size)
-    offset = video_times[best_i + biggest.b]
+    # Anchor at the earliest SUBSTANTIAL block, not the single
+    # longest run: a clip's start maps to where its first matched
+    # words occur (the longest run can sit mid-scene and pull the
+    # timestamp late, e.g. +12s on a real Urdu clip).
+    threshold = max(3, biggest.size // 2)
+    first_big = min((b for b in blocks if b.size >= threshold),
+                    key=lambda b: b.b)
+    offset = video_times[best_i + first_big.b]
     span = min(W, 30)
     return {
         "score": best_score,

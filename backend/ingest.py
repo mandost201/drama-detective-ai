@@ -79,7 +79,7 @@ def transcribe_missing_episodes(pid, progress_fn=None, video_ids=None):
                 segs = _analyze.transcribe_audio_file(mp3)
                 if segs:
                     db.add_segments(v["id"], segs)
-                    db.mark_transcript(v["id"], True)
+                    db.mark_transcript(v["id"], True, source="whisper")
                     report["done"] += 1
                     print(f"[ingest] whisper ok: {yid} ({len(segs)} segs)")
                 else:
@@ -172,7 +172,7 @@ def index_subtitle_text(pid, video_row_id, text, filename="subtitles.srt"):
         raise ValueError("Is file mein koi subtitle lines nahi "
                          "mileen — sahi .srt ya .vtt file dein.")
     db.add_segments(video_row_id, segs)
-    db.mark_transcript(video_row_id, True)
+    db.mark_transcript(video_row_id, True, source="subtitle")
     _index_embeddings_for_video(pid, video_row_id)
     return len(segs)
 
@@ -201,7 +201,7 @@ def run_playlist_job(jid: str, pid: str, url: str):
                 segs = fetch_transcript(v["youtube_id"])
                 if segs:
                     db.add_segments(v["id"], segs)
-                    db.mark_transcript(v["id"], True)
+                    db.mark_transcript(v["id"], True, source="whisper")
                 else:
                     db.mark_transcript(v["id"], False)
             except Exception as e:
