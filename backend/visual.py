@@ -113,14 +113,11 @@ def _parse_sheets(mhtml_path):
     return images, ranges
 
 
-def scene_frames(video_id, start, end, max_frames=3):
-    """Real frames at the start / middle / end of [start, end].
-
-    Returns {"available": bool, "reason": str,
-             "frames": [{"timestamp": float, "hms": str, "path": str}]}
-    Never raises; any failure is reported in "reason"."""
+def _frames_at(video_id, targets, meta=None):
+    """Crop real storyboard frames at the given timestamps.
+    Shared by scene_frames / episode_frames. Never raises."""
     try:
-        meta = _metadata(video_id)
+        meta = meta or _metadata(video_id)
         if not meta:
             return {"available": False, "frames": [],
                     "reason": "YouTube did not offer storyboard previews "
@@ -164,16 +161,14 @@ def scene_frames(video_id, start, end, max_frames=3):
             cx, cy = (cell % cols) * fw, (cell // cols) * fh
             return sheets[idx].crop((cx, cy, cx + fw, cy + fh))
 
-        targets = [start, (start + end) / 2.0, max(start, end - 1.0)]
-        # de-duplicate near-identical targets for very short scenes
-        uniq = []
-        for t in targets:
-            if not uniq or abs(t - uniq[-1]) >= 5:
-                uniq.append(t)
         out_dir = _SB_DIR / "frames"
         out_dir.mkdir(parents=True, exist_ok=True)
         frames = []
-        for t in uniq[:max_frames]:
+        last = None
+        for t in targets:
+            if last is not None and abs(t - last) < 5:
+                continue
+            last = t
             img = frame_at(t)
             p = out_dir / f"{video_id}_{int(t)}.png"
             img.save(str(p))
@@ -188,3 +183,36 @@ def scene_frames(video_id, start, end, max_frames=3):
     except Exception as e:
         return {"available": False, "frames": [],
                 "reason": f"Visual check failed: {type(e).__name__}: {e}"}
+
+
+def scene_frames(video_id, start, end, max_frames=3):
+    """Real frames at the start / middle / end of [start, end].
+
+    Returns {"available": bool, "reason": str,
+             "frames": [{"timestamp", "hms", "path"}]}."""
+    meta = _metadata(video_id)
+    if not meta:
+        return {"available": False, "frames": [],
+                "reason": "YouTube did not offer storyboard previews "
+                          "for this video."}
+    targets = [start, (start + end) / 2.0, max(start, end - 1.0)]
+    out = _frames_at(video_id, targets, meta)
+    out["frames"] = out["frames"][:max_frames]
+    return out
+
+
+def episode_frames(video_id, count=8):
+    """Evenly spaced real frames across the WHOLE episode.
+
+    The visual fallback for episodes with no transcript at all: the
+    user can spot a scene with their own eyes and note its
+    approximate time, even when no dialogue is indexed. Same honesty
+    rules as scene_frames - real frames only, no recognition claims."""
+    meta = _metadata(video_id)
+    if not meta or not meta[0]:
+        return {"available": False, "frames": [],
+                "reason": "YouTube did not offer storyboard previews "
+                          "for this video."}
+    duration = meta[0]
+    targets = [duration * (i + 0.5) / count for i in range(count)]
+    return _frames_at(video_id, targets, meta)

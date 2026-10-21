@@ -9,6 +9,15 @@ Find the **exact episode and timestamp** of a scene from a drama playlist.
 
 Also included: **clip finder** (upload a short clip → its episode + timestamp), **video upload** (any video file → transcribed → searchable at the exact second), **recent searches**, and **feedback/correction** when a suggested episode is wrong.
 
+## When captions are missing
+
+An episode counts as searchable **only** when transcript segments are actually indexed for it — the app never fakes coverage. Three real fallbacks, all in the panel under the playlist:
+
+1. **Broader caption fetch (automatic).** The fetcher no longer asks YouTube for English only: it tries English, Urdu and Hindi tracks (manual or auto), then literally any language offered. Many "no captions" episodes turn out to have non-English captions and become searchable on analysis. (This was the actual root cause for playlists where most episodes showed as caption-less.)
+2. **Whisper transcription (optional, free, slow).** Per episode or for all missing episodes, as a tracked background job with visible progress and per-episode errors. Audio comes from the same public download path as everything else (no DRM/access bypass). On the free server a 35–40 minute episode can take roughly as long to transcribe, and the app must stay awake — the panel says so, and an episode is marked searchable only after its transcript is indexed. No API key is required.
+3. **Your own subtitle file.** Upload a `.srt`/`.vtt` for a specific episode; its cues are parsed, indexed and embedded immediately.
+4. **Visual fallback.** For episodes with no transcript at all, the panel can show real storyboard frames from across the episode so a scene can be spotted by eye and its approximate time noted. (Frames are evidence for the user; the app does not claim to recognize their content.)
+
 ## Exact Clip Finder (upgraded search results)
 
 Every Step-2 result now also carries:

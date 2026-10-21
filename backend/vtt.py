@@ -46,6 +46,47 @@ def parse_vtt(raw: str):
     return _merge_repeats(cues)
 
 
+def parse_srt(raw: str):
+    """Parse SubRip (.srt) text into (start, end, text) segments.
+
+    Unlike auto-caption VTT, a user-supplied SRT has proper cues, so
+    lines are NOT repeat-merged (a repeated "yes" in the next cue is
+    real dialogue, not a rolling-caption artifact)."""
+    cues = []
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if "-->" in line:
+            parts = line.split("-->")
+            start = ts_to_seconds(parts[0])
+            end = ts_to_seconds(parts[1]) if len(parts) > 1 else start + 2
+            i += 1
+            text_lines = []
+            while i < len(lines) and lines[i].strip():
+                text_lines.append(lines[i])
+                i += 1
+            text = clean_text(" ".join(text_lines))
+            if text:
+                cues.append((start, end, text))
+        else:
+            i += 1
+    return cues
+
+
+def parse_subtitles(raw: str, filename: str = ""):
+    """Parse subtitle text from a user file (.vtt or .srt), chosen by
+    extension/content. Returns (start, end, text) segments."""
+    name = (filename or "").lower()
+    head = (raw or "").lstrip()[:64].upper()
+    if name.endswith(".srt") or (not name.endswith(".vtt")
+                                 and "WEBVTT" not in head):
+        segs = parse_srt(raw)
+        if segs:
+            return segs
+    return parse_vtt(raw)
+
+
 def parse_srv3_json(data: str):
     """Fallback parser for YouTube srv3 JSON captions (not currently used)."""
     return []
