@@ -142,6 +142,74 @@ def _scene_text(video_id, center_start, window=60.0):
                     if abs(s["start"] - center_start) <= window)
 
 
+def playlist_coverage(pid):
+    """How much of the playlist can actually be searched:
+    {"total", "searchable", "missing", "pct"}. A video counts as
+    searchable only when it has an indexed transcript. Episodes
+    without captions are reported - never silently skipped."""
+    vids = db.get_videos(pid)
+    total = len(vids)
+    searchable = sum(1 for v in vids if v["has_transcript"])
+    return {"total": total, "searchable": searchable,
+            "missing": total - searchable,
+            "pct": round(100.0 * searchable / total, 1) if total else 0.0}
+
+
+def scene_range(video_id, anchor_start, terms=None, gap_threshold=20.0,
+                focus_window=90.0, lead=10.0, max_span=300.0):
+    """Estimate the scene's (start, end) around the anchor segment.
+
+    This is an ESTIMATE, labelled as such in the UI - never an exact
+    cut. Real subtitle tracks have pauses inside a scene (entrances,
+    reaction shots), so the method works on the anchor's dialogue
+    block rather than single lines:
+      1. Dialogue block: expand from the anchor while the silence
+         between consecutive caption segments stays <= gap_threshold
+         (20s - smaller gaps turned out to split single scenes).
+      2. Focus trim: inside that block and within +/-focus_window of
+         the anchor, take the outermost segments matching the user's
+         distinctive terms, plus a short lead-in/out, so unrelated
+         dialogue sharing the block does not inflate the range.
+      3. Cap the span at max_span around the anchor.
+    """
+    segs = db.get_segments(video_id)
+    if not segs:
+        return anchor_start, anchor_start
+    idx = min(range(len(segs)),
+              key=lambda i: abs(segs[i]["start"] - anchor_start))
+    lo = idx
+    while lo > 0 and segs[lo]["start"] - segs[lo - 1]["end"] <= gap_threshold:
+        lo -= 1
+    hi = idx
+    while (hi < len(segs) - 1
+           and segs[hi + 1]["start"] - segs[hi]["end"] <= gap_threshold):
+        hi += 1
+    start, end = segs[lo]["start"], segs[hi]["end"]
+    if terms:
+        core = [i for i in range(lo, hi + 1)
+                if abs(segs[i]["start"] - anchor_start) <= focus_window
+                and any(_term_in_text(t, segs[i]["text"]) for t in terms)]
+        if core:
+            c_lo, c_hi = core[0], core[-1]
+            j = c_lo
+            while (j - 1 >= lo
+                   and segs[j]["start"] - segs[j - 1]["end"] <= gap_threshold
+                   and segs[c_lo]["start"] - segs[j - 1]["start"] <= lead):
+                j -= 1
+            c_lo = j
+            j = c_hi
+            while (j + 1 <= hi
+                   and segs[j + 1]["start"] - segs[j]["end"] <= gap_threshold
+                   and segs[j + 1]["end"] - segs[c_hi]["end"] <= lead):
+                j += 1
+            c_hi = j
+            start, end = segs[c_lo]["start"], segs[c_hi]["end"]
+    if end - start > max_span:
+        start = max(start, anchor_start - max_span / 2.0)
+        end = min(end, anchor_start + max_span / 2.0)
+    return round(float(start), 1), round(float(end), 1)
+
+
 def _build_result(video, start, score, method, matched_lines, reasons):
     return {
         "video_id": video["id"],
@@ -303,6 +371,28 @@ def search(pid, query, mode="auto", top_k=8):
         r["cov_factor"] = round(_cov, 3)
         r["score"] = round(r["score"], 3)
 
+    # ---- Exact Clip Finder: scene ranges + playlist coverage ----------
+    # Every result gets an estimated scene start/end (dialogue-block
+    # expansion + focus trim, see scene_range), and the main watch link
+    # opens at the scene start. Confidence is capped when playlist
+    # coverage is poor: with most episodes unsearchable, the true
+    # scene may sit in an episode that could not be checked at all.
+    cov = playlist_coverage(pid)
+    for r in ranked:
+        rs, re_ = scene_range(r["video_id"], r["timestamp"], _dist)
+        r["scene_start"], r["scene_end"] = rs, re_
+        r["scene_start_hms"] = format_hms(rs)
+        r["scene_end_hms"] = format_hms(re_)
+        r["url_at"] = watch_url_at(r["youtube_id"], rs)
+        r["match_type"] = "transcript"
+        if cov["pct"] < 50.0 and r["confidence"] == "high":
+            r["confidence"] = "medium"
+            r["reasons"].append(
+                f"Confidence capped: only {cov['searchable']} of "
+                f"{cov['total']} episodes in this playlist are "
+                "searchable (the rest have no usable captions), so the "
+                "scene could be in an episode that was not checked.")
+
     results = ranked[:3]
     alternatives = ranked[3:3 + max(0, top_k - 3)]
 
@@ -331,4 +421,5 @@ def search(pid, query, mode="auto", top_k=8):
                   "check the spelling of names.")
     return {"results": results, "alternatives": alternatives,
             "method": method_note, "note": note,
+            "coverage": cov,
             "semantic_available": embeddings.available()}

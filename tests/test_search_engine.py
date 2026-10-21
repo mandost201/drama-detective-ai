@@ -26,7 +26,10 @@ def test_english_dialogue_finds_ep25(built_db):
     assert top["episode"] == 25
     assert 800 <= top["timestamp"] <= 940, top["timestamp_hms"]
     assert top["confidence"] in ("high", "medium")
-    assert top["url_at"].endswith(f"t={int(top['timestamp'])}s")
+    # Exact Clip Finder: the watch link opens at the estimated scene
+    # start, and the anchor timestamp sits inside the scene range.
+    assert top["url_at"].endswith(f"t={int(top['scene_start'])}s")
+    assert top["scene_start"] <= top["timestamp"] <= top["scene_end"]
 
 
 def test_roman_urdu_description_finds_ep25(built_db):
