@@ -33,9 +33,11 @@ os.environ.setdefault("SEEDS_PATH",
                       str(Path(__file__).resolve().parent / "seeds.json"))
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from backend import db, ingest
 from backend import search as search_mod
+from backend import visual as visual_mod
 from backend import embeddings as emb_mod
 from backend.youtube import extract_playlist_id, extract_video_id
 
@@ -363,6 +365,16 @@ vids = db.get_videos(pid)
 with_cap = sum(1 for v in vids if v.get("has_transcript"))
 st.caption(f"🎬 {DRAMA} • {len(vids)} episodes • {with_cap} with searchable "
            f"captions/transcripts • {db.segment_count(pid):,} segments indexed")
+_cov = search_mod.playlist_coverage(pid)
+if _cov["total"]:
+    if _cov["missing"]:
+        st.caption(f"📊 Playlist coverage: {_cov['searchable']}/{_cov['total']} "
+                   f"episodes searchable ({_cov['pct']}%) — {_cov['missing']} "
+                   "episode(s) ke captions nahi, wo search nahi ho sakte "
+                   "(neeche transcribe button hai).")
+    else:
+        st.caption(f"📊 Playlist coverage: tamam {_cov['total']} episodes "
+                   "searchable (100%).")
 
 # ---- transcribe episodes that have no captions (runs on the server)
 _missing = [v for v in vids if not v.get("has_transcript")]
@@ -422,7 +434,11 @@ with st.sidebar:
         "kabhi 100% nahi dikhaya jata.")
 
 # ---------------------------------------------------------------- step 2: scene search
-st.header("Step 2 — Describe the scene")
+st.header("Step 2 — Describe the scene (Exact Clip Finder)")
+st.caption("Har result ke saath scene ka estimated start–end range, playlist "
+           "coverage aur matching dialogue saboot ke tor par diya jata hai. "
+           "Range dialogue ki continuity se estimate hoti hai — ye exact "
+           "cut ka daawa nahi hai.")
 query = st.text_area(
     "Scene description (English / Roman Urdu / Urdu / Hindi)",
     placeholder="e.g. vakil sahab dulha dulhan aa gaye hain, vakil kehta hai "
@@ -447,6 +463,7 @@ if _do_search:
     st.session_state.last_query = q
     st.session_state.last_results = res
     st.session_state.fb_mode = None
+    st.session_state.visual_res = None
     try:
         _top = (res.get("results") or [None])[0]
         db.log_search(pid, q,
@@ -461,6 +478,17 @@ res = st.session_state.get("last_results")
 if res is not None:
     q = st.session_state.get("last_query", "")
     st.caption(f"Search method: {res.get('method')}")
+    _rcov = res.get("coverage") or {}
+    if _rcov.get("total"):
+        if _rcov.get("missing"):
+            st.warning(f"📊 Coverage: {_rcov['searchable']}/{_rcov['total']} "
+                       f"episodes searched ({_rcov['pct']}%). "
+                       f"{_rcov['missing']} episode(s) ke captions maujood "
+                       "nahi thay — wo is search mein shamil nahi hue, is "
+                       "liye asal scene un mein bhi ho sakta hai.")
+        else:
+            st.caption(f"📊 Coverage: tamam {_rcov['total']} episodes "
+                       "search hue (100%).")
     if res.get("note"):
         st.warning(res["note"])
     results = res.get("results") or []
@@ -474,18 +502,21 @@ if res is not None:
     for i, r in enumerate(results, 1):
         with st.container(border=True):
             st.subheader(f"#{i} — Episode {r['episode']}: {r['title']}")
-            st.caption(f"🎬 Drama: {DRAMA}")
+            st.caption(f"🎬 Drama: {DRAMA} • Match type: 📜 dialogue "
+                       "(transcript) — frames ke liye neeche visual check")
             cols = st.columns([1, 1, 1])
-            cols[0].metric("⏱ Timestamp", r["timestamp_hms"])
+            cols[0].metric("⏱ Scene (est.)",
+                           f"{r.get('scene_start_hms', r['timestamp_hms'])} – "
+                           f"{r.get('scene_end_hms', r['timestamp_hms'])}")
             cols[1].metric("Confidence", _CONF_EMOJI.get(r["confidence"], r["confidence"]))
             if _is_upload_video(r):
                 vpath = _upload_video_path(r["youtube_id"])
                 if vpath:
-                    cols[2].caption("▶ Neeche player isi second se chalega")
+                    cols[2].caption("▶ Neeche player scene start se chalega")
                 else:
                     cols[2].caption("Video file server par nahi mili")
             else:
-                cols[2].link_button("▶ Watch scene", r["url_at"])
+                cols[2].link_button("▶ Watch from scene start", r["url_at"])
             if r.get("reasons"):
                 st.write("**Why this matches:**")
                 for reason in r["reasons"]:
@@ -500,7 +531,46 @@ if res is not None:
             if _is_upload_video(r):
                 vpath = _upload_video_path(r["youtube_id"])
                 if vpath:
-                    st.video(str(vpath), start_time=int(r["timestamp"]))
+                    st.video(str(vpath), start_time=int(r.get("scene_start", r["timestamp"])))
+            elif i == 1:
+                with st.expander("▶️ Scene preview & 🖼️ visual check"):
+                    st.caption("Preview YouTube ke official player ke andar "
+                               "scene start se end tak chalega. Ye koi "
+                               "downloadable clip NAHI hai — sirf YouTube "
+                               "player hai.")
+                    components.iframe(
+                        f"https://www.youtube.com/embed/{r['youtube_id']}"
+                        f"?start={int(r.get('scene_start', r['timestamp']))}"
+                        f"&end={int(r.get('scene_end', r['timestamp']))}&rel=0",
+                        height=315)
+                    if st.button("🖼️ Visual check — scene ke asal frames dikhao",
+                                 key="visual_btn"):
+                        with st.spinner("Episode ke preview frames la raha "
+                                        "hoon… (pehli dafa ~1 minute lag "
+                                        "sakta hai)"):
+                            st.session_state.visual_res = visual_mod.scene_frames(
+                                r["youtube_id"],
+                                r.get("scene_start", r["timestamp"]),
+                                r.get("scene_end", r["timestamp"]))
+                    _vres = st.session_state.get("visual_res")
+                    if _vres:
+                        if _vres.get("available"):
+                            _frames = _vres["frames"]
+                            _fcols = st.columns(len(_frames))
+                            for _fc, _fr in zip(_fcols, _frames):
+                                _fc.image(_fr["path"],
+                                          caption=f"⏱ {_fr['hms']}")
+                            st.caption(
+                                "Ye frames episode ke asal storyboard "
+                                "previews hain (YouTube ki public preview "
+                                "images) — inhe apne scene se mila kar "
+                                "dekhein. Dialogue evidence ke saath ye "
+                                "visual tasdeeq hai; app khud frame ke "
+                                "characters ko identify nahi karta.")
+                        else:
+                            st.info("Visual check is video ke liye "
+                                    "available nahi: "
+                                    + str(_vres.get("reason")))
 
     # ------------------------------------------------ feedback / correction
     if results:
@@ -540,11 +610,13 @@ if res is not None:
             for r in alts:
                 if _is_upload_video(r):
                     st.markdown(
-                        f"- **{r['title']}** @ `{r['timestamp_hms']}` "
+                        f"- **{r['title']}** @ `{r.get('scene_start_hms', r['timestamp_hms'])} – "
+                        f"{r.get('scene_end_hms', r['timestamp_hms'])}` "
                         f"({_CONF_EMOJI.get(r['confidence'], r['confidence'])})")
                 else:
                     st.markdown(
-                        f"- **Episode {r['episode']}** @ `{r['timestamp_hms']}` — "
+                        f"- **Episode {r['episode']}** @ `{r.get('scene_start_hms', r['timestamp_hms'])} – "
+                        f"{r.get('scene_end_hms', r['timestamp_hms'])}` — "
                         f"[{r['title']}]({r['url_at']}) "
                         f"({_CONF_EMOJI.get(r['confidence'], r['confidence'])})")
 
