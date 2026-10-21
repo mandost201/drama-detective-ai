@@ -224,9 +224,9 @@ def test_ingest_marks_caption_source_not_whisper(tmp_path, monkeypatch):
                 "url": "https://www.youtube.com/watch?v=ING00000001",
                 "thumbnail": None}]))
         monkeypatch.setattr(
-            ingest, "fetch_transcript",
-            lambda yid: [(0.0, 2.0, "Caption line one."),
-                         (2.0, 4.0, "Caption line two.")])
+            ingest, "fetch_transcript_meta",
+            lambda yid: ([(0.0, 2.0, "Caption line one."),
+                          (2.0, 4.0, "Caption line two.")], "en"))
         ingest.run_playlist_job(jid, pid,
                                 "https://youtube.com/playlist?list=ING")
         v = db.get_videos(pid)[0]
