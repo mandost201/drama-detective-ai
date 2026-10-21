@@ -37,6 +37,7 @@ import streamlit.components.v1 as components
 
 from backend import db, ingest
 from backend import search as search_mod
+from backend import selection as sel_mod
 from backend import visual as visual_mod
 from backend import embeddings as emb_mod
 from backend.youtube import extract_playlist_id, extract_video_id
@@ -249,7 +250,9 @@ st.caption("Find the exact episode & timestamp of any drama scene — "
 # ---------------------------------------------------------------- session state
 for _k, _v in [("active_pid", None), ("ingest_jid", None),
                ("last_query", ""), ("last_results", None),
-               ("fb_mode", None), ("run_search", False)]:
+               ("fb_mode", None), ("run_search", False),
+               ("submitted", None), ("results_pid", None),
+               ("analyze_error", None), ("visual_res", None)]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
@@ -281,6 +284,18 @@ with st.expander("➕ Analyze a new playlist", expanded=st.session_state.active_
                 st.session_state.active_pid = pid
                 st.session_state.ingest_jid = jid
                 st.session_state.last_results = None
+                st.session_state.results_pid = None
+                st.session_state.visual_res = None
+                st.session_state.analyze_error = None
+                # The new playlist becomes the selection NOW: setting
+                # the picker's widget value before it is instantiated
+                # below. (Leaving this to the selectbox `index` was
+                # the wrong-playlist bug: Streamlit ignores `index`
+                # once a picker value exists, so searches kept
+                # running against the previously selected drama.)
+                st.session_state["playlist_picker"] = pid
+                st.session_state.submitted = {
+                    "pid": pid, "name": (drama_name or "").strip()}
             st.rerun()
 
 # ---------------------------------------------------------------- ingest progress
@@ -319,12 +334,47 @@ if jid:
                 n = apply_seed_transcripts(pid)
                 if n:
                     st.success(f"Added verified transcripts for {n} episode(s) missing captions.")
+            # Validate what the analysis ACTUALLY produced and say so:
+            # how many videos were found vs how many got indexed
+            # captions. Never claim a playlist is ready when it is not.
+            _pl = db.get_playlist(pid) or {}
+            _vs = db.get_videos(pid)
+            _cap = sum(1 for v in _vs if v.get("has_transcript"))
+            _sub = st.session_state.get("submitted") or {}
+            _nm = _sub.get("name") or _pl.get("drama_name") or "Playlist"
+            if _pl.get("status") == "ready" and _vs:
+                _cov = search_mod.playlist_coverage(pid)
+                st.success(
+                    f"✅ '{_nm}' ready hai: {len(_vs)} videos mile, "
+                    f"{_cap} ke captions/transcripts indexed "
+                    f"({_cov['pct']}% coverage). Ab search aur clip "
+                    "finder isi playlist par chalenge.")
+                st.session_state["playlist_picker"] = pid
+            else:
+                st.session_state.analyze_error = (
+                    f"'{_nm}' ki playlist ready nahi hui: status="
+                    f"{_pl.get('status')}, videos mile={len(_vs)}, "
+                    f"captions indexed={_cap}. Ho sakta hai link "
+                    "private ho, ghalat ho, ya YouTube ne videos na di "
+                    "hon. Clip/scene search is playlist par nahi "
+                    "chalega jab tak ye ready na ho.")
         st.rerun()
     elif job and job.get("status") == "error":
         st.error(f"Analysis failed: {job.get('error')}")
+        st.session_state.analyze_error = (
+            f"Analysis failed: {job.get('error')}")
         st.session_state.ingest_jid = None
 
+if st.session_state.get("analyze_error"):
+    st.error(st.session_state.analyze_error)
+
 # ---------------------------------------------------------------- playlist picker
+# Selection is by stable playlist ID (widget key "playlist_picker"),
+# never by display label: labels can collide, and a label-keyed dict
+# silently dropped playlists. The analyze handler sets the picker's
+# session value to the new playlist, so after an analysis the picker,
+# the captions index, the search and the clip finder ALL point at the
+# playlist the user just submitted.
 playlists = db.list_playlists()
 ready = [p for p in playlists if p.get("status") == "ready"]
 if not ready:
@@ -332,27 +382,25 @@ if not ready:
             "searchable ho jayegi.")
     st.stop()
 
-def _pl_label(p):
-    name = p.get("drama_name") or p.get("title") or p["url"][:40]
-    return f"{name} ({p.get('video_count', 0)} videos)"
-
-options = {_pl_label(p): p["id"] for p in ready}
-labels = list(options.keys())
-default_idx = 0
-if pid in options.values():
-    default_idx = labels.index(next(k for k, v in options.items() if v == pid))
-else:
-    # Fresh session: default to the largest ready playlist (the user's real
-    # playlist), not whatever the database returns first (e.g. a single
-    # test/upload video) - so clip matching never silently targets the
-    # wrong playlist.
-    _biggest = max(ready, key=lambda p: p.get("video_count", 0) or 0)
-    _biggest_label = next((k for k, v in options.items() if v == _biggest["id"]), None)
-    if _biggest_label is not None:
-        default_idx = labels.index(_biggest_label)
-choice = st.selectbox("📚 Playlist", labels, index=default_idx)
-pid = options[choice]
+_labels_by_id = sel_mod.unique_labels(ready)
+_ready_ids = [p["id"] for p in ready]
+if st.session_state.get("playlist_picker") not in _ready_ids:
+    st.session_state["playlist_picker"] = sel_mod.default_selection(
+        ready, st.session_state.get("active_pid"))
+pid = st.selectbox("📚 Playlist", _ready_ids,
+                   format_func=lambda i: _labels_by_id.get(i, str(i)),
+                   key="playlist_picker")
 st.session_state.active_pid = pid
+choice = _labels_by_id.get(pid, str(pid))
+
+# Results belong to the playlist that produced them. If the selection
+# changed since the last search, drop the old results instead of
+# showing one drama's matches under another drama's name.
+if sel_mod.stale_results(st.session_state.get("results_pid"), pid):
+    st.session_state.last_results = None
+    st.session_state.results_pid = None
+    st.session_state.visual_res = None
+    st.session_state.fb_mode = None
 
 pl = db.get_playlist(pid)
 DRAMA = (pl.get("drama_name") or pl.get("title") or "This drama").strip()
@@ -462,6 +510,7 @@ if _do_search:
         res = search_mod.search(pid, q)
     st.session_state.last_query = q
     st.session_state.last_results = res
+    st.session_state.results_pid = pid
     st.session_state.fb_mode = None
     st.session_state.visual_res = None
     try:
@@ -640,6 +689,16 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
     if up2 is None:
         st.warning("Please choose a clip first.")
         st.stop()
+    # Context lock: if the playlist the user last submitted never
+    # became ready and the current selection is a different one, the
+    # clip would be matched against the WRONG drama. Block with a
+    # clear error instead of returning a wrong episode.
+    _block = sel_mod.clip_block_reason(
+        st.session_state.get("submitted"), pid,
+        {p["id"] for p in ready})
+    if _block:
+        st.error(_block)
+        st.stop()
     cpath = _uploads_dir() / f"clip_{up2.name}"
     with open(cpath, "wb") as f:
         f.write(up2.getbuffer())
@@ -706,10 +765,23 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
 
     if ranked:
         results_clip = [_to_result(s, v, a) for s, v, a in ranked[:3]]
-        st.success("✅ Found it! (precise dialogue match)")
     else:
         results_clip = _fallback_results
-        st.success("✅ Found it! (semantic match)")
+    # A weak score is a weak candidate, never a "found it": 40%
+    # semantic similarity once sent a user to the wrong drama's
+    # episode with a success banner on top.
+    _best = max((r.get("score", 0) for r in results_clip), default=0)
+    _how = "precise dialogue match" if ranked else "semantic match"
+    if _best < 0.5:
+        st.warning(f"⚠️ Sirf weak candidate(s) mile (best match "
+                   f"{_best:.0%}, {_how}). Ye verified exact match "
+                   "NAHI hai — clip is playlist ke kisi aur episode "
+                   "ka ho sakta hai, ya is ke captions adhooray hain. "
+                   "Neeche candidates sirf andaze ke tor par hain.")
+    else:
+        st.success(f"✅ Strong candidate mila ({_how}, match "
+                   f"{_best:.0%}). Episode aur time neeche hai — "
+                   "evidence check kar lein.")
     with st.expander("Clip transcript (translated to English)"):
         st.write(clip_text)
     for r in results_clip:
@@ -720,9 +792,9 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
         conf = r.get("confidence", "")
         score = r.get("score", 0)
         if url_at:
-            st.markdown(f"**Episode {ep}** @ `{ts}` — [{title}]({url_at}) — {conf} (match {score:.0%})")
+            st.markdown(f"**{DRAMA} — Episode {ep}** @ `{ts}` — [{title}]({url_at}) — {conf} (match {score:.0%})")
         else:
-            st.markdown(f"**Episode {ep}** @ `{ts}` — {title} — {conf} (match {score:.0%})")
+            st.markdown(f"**{DRAMA} — Episode {ep}** @ `{ts}` — {title} — {conf} (match {score:.0%})")
 
 # ---------------------------------------------------------------- upload & analyze your own video
 st.divider()
