@@ -1,0 +1,8 @@
+# Drama Detective AI — Streamlit Cloud (frontend + backend modules, SQLite, Whisper)
+streamlit>=1.30
+yt-dlp>=2024.8.6
+youtube-transcript-api>=0.6.2
+fastembed>=0.3.6
+faster-whisper>=1.1.0
+hf_transfer>=0.1.9
+numpy>=1.26
