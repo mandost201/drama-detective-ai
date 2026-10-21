@@ -304,6 +304,92 @@ def _alignment_verdict(score, matched_words):
     return None
 
 
+def verify_boundaries(youtube_id, start, end, frames=None):
+    """Frame-check a scene range's two boundaries against the
+    episode's own storyboard frames.
+
+    For each edge, the frame just OUTSIDE the range is compared
+    with the frame just INSIDE it (dHash distance; >=16 reads as a
+    visual change, <10 as the same shot continuing):
+
+      start_cut / end_cut = True  - a visual cut sits near the
+                                    estimated boundary: the range
+                                    is consistent with the frames.
+      = False                     - the same shot flows across the
+                                    boundary: the transcript range
+                                    is probably cutting a longer
+                                    scene; the kind STAYS
+                                    transcript_estimate and the
+                                    detail says so.
+      = None                      - no usable frame pair.
+
+    kind is "frame_checked" only when BOTH edges show a cut.
+    Storyboard granularity is seconds - this verifies the boundary
+    region, never a frame-exact cut. Returns a dict with kind,
+    status, start_cut, end_cut, detail."""
+    if frames is None:
+        from . import visual as visual_mod
+        got = visual_mod.boundary_frames(youtube_id, start, end)
+        if not got.get("available") or not got.get("frames"):
+            return {"kind": "transcript_estimate",
+                    "status": "unavailable",
+                    "start_cut": None, "end_cut": None,
+                    "detail": "Storyboard frames available nahi — "
+                              "range sirf transcript par mabni "
+                              "andaza hai."}
+        frames = got["frames"]
+
+    def pick(target, before):
+        cands = [f for f in frames
+                 if (f["timestamp"] < target if before
+                     else f["timestamp"] >= target)]
+        if not cands:
+            return None
+        return min(cands, key=lambda f: abs(f["timestamp"] - target))
+
+    def cut(before_f, inside_f):
+        if not before_f or not inside_f:
+            return None
+        try:
+            from PIL import Image
+            d = _hamming(_dhash(Image.open(before_f["path"])),
+                         _dhash(Image.open(inside_f["path"])))
+        except Exception:
+            return None
+        if d >= 16:
+            return True
+        if d < 10:
+            return False
+        return None  # ambiguous middle: no claim either way
+
+    start_cut = cut(pick(start, True), pick(start, False))
+    end_cut = cut(pick(end, False), pick(end, True))
+    if start_cut and end_cut:
+        return {"kind": "frame_checked", "status": "checked",
+                "start_cut": True, "end_cut": True,
+                "detail": "Frames mein scene ki dono sarhadon ke "
+                          "qareeb visual cut nazar aaya — range "
+                          "frames se consistent hai (storyboard "
+                          "ki granularity tak)."}
+    notes = []
+    if start_cut is False:
+        notes.append("shuruaat par frames aik hi shot ko jari "
+                     "dikhatay hain — scene shayad is se pehle "
+                     "shuru hoti hai")
+    if end_cut is False:
+        notes.append("aakhir par frames aik hi shot ko jari "
+                     "dikhatay hain — scene shayad is ke baad bhi "
+                     "jari hai")
+    if start_cut and not notes:
+        notes.append("shuruaat frames se consistent hai")
+    if end_cut and not notes:
+        notes.append("aakhir frames se consistent hai")
+    return {"kind": "transcript_estimate", "status": "checked",
+            "start_cut": start_cut, "end_cut": end_cut,
+            "detail": "Frames check hua lekin sarhad(en) confirm "
+                      "nahi hueen: " + "; ".join(notes) + "."}
+
+
 def _clip_result(cand, clip_dur):
     v, a, score = cand["video"], cand["a"], cand["score"]
     start = float(a["offset"])
@@ -319,13 +405,42 @@ def _clip_result(cand, clip_dur):
         reasons.append(
             "Clip ka sirf aik hissa match hua — clip edited/montage "
             "ho sakta hai; diya gaya time usi matched hisse ka hai.")
+    # The COMPLETE scene around the match, estimated from the
+    # episode transcript itself - reported separately from the
+    # clip's matched window, which stays the precise claim. The
+    # watch link still opens at the matched moment; the scene
+    # range is the surrounding context, labelled an estimate.
+    s_start, s_end = search_mod.scene_range(v["id"], start)
+    b_start, b_end = search_mod.scene_block(v["id"], start)
+    if s_start < start - 3:
+        reasons.append(
+            f"Clip scene ke darmiyan se shuru hota hai — poora "
+            f"scene taqreeban {format_hms(s_start)} se shuru hota "
+            f"hai (transcript estimate); clip ka matched hissa "
+            f"{format_hms(start)} – {format_hms(end)} hai.")
+    if s_end > end + 3:
+        reasons.append(
+            f"Scene clip ke khatam honay ke baad bhi taqreeban "
+            f"{format_hms(s_end)} tak jari rehta hai "
+            f"(transcript estimate).")
     return {
         "video_id": v["id"], "youtube_id": v["youtube_id"],
         "title": v["title"], "episode": v["position"],
         "timestamp": round(start, 1), "timestamp_hms": format_hms(start),
-        "scene_start": round(start, 1), "scene_end": round(end, 1),
-        "scene_start_hms": format_hms(start),
-        "scene_end_hms": format_hms(end),
+        "match_start": round(start, 1), "match_end": round(end, 1),
+        "match_start_hms": format_hms(start),
+        "match_end_hms": format_hms(end),
+        "scene_start": round(s_start, 1), "scene_end": round(s_end, 1),
+        "scene_start_hms": format_hms(s_start),
+        "scene_end_hms": format_hms(s_end),
+        "block_start": round(b_start, 1), "block_end": round(b_end, 1),
+        "block_start_hms": format_hms(b_start),
+        "block_end_hms": format_hms(b_end),
+        "boundary": {"kind": "transcript_estimate",
+                     "status": "not_checked",
+                     "start_cut": None, "end_cut": None,
+                     "detail": "Scene range transcript par mabni "
+                               "andaza hai."},
         "url": v["url"], "url_at": watch_url_at(v["youtube_id"], start),
         "thumbnail": v.get("thumbnail"),
         "confidence": search_mod._confidence(score),
@@ -496,6 +611,12 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
                                        top["youtube_id"],
                                        top["scene_start"],
                                        top["scene_end"])
+        # Frame-check the SCENE range's boundaries themselves
+        # (episode-internal cuts - a different question from the
+        # clip-vs-episode frame similarity above).
+        top["boundary"] = verify_boundaries(top["youtube_id"],
+                                            top["scene_start"],
+                                            top["scene_end"])
     return {"ok": True, "language": lang, "language_probability": prob,
             "clip_transcript": text_o,
             "clip_transcript_en": text_en or None,

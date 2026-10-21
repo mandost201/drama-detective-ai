@@ -746,6 +746,33 @@ if res is not None:
                     cols[2].caption("Video file server par nahi mili")
             else:
                 cols[2].link_button("▶ Watch from scene start", r["url_at"])
+            if r.get("matched_at_hms"):
+                st.caption(f"🎯 Matched line @ {r['matched_at_hms']} — "
+                           "watch link scene ke start se khulta hai, "
+                           "ye line usi scene ke andar aati hai.")
+            if (r.get("focus_start") is not None
+                    and (r["focus_start"] > r.get("scene_start", 0) + 5
+                         or r["focus_end"] < r.get("scene_end", 0) - 5)):
+                st.caption(f"🎯 Matched hisse ke gird ka takhmina: "
+                           f"{r['focus_start_hms']} – "
+                           f"{r['focus_end_hms']} — scene ka wo hissa "
+                           "jahan aap ke alfaz aate hain.")
+            if (r.get("block_start") is not None
+                    and (r["block_start"] < r.get("scene_start", 0) - 10
+                         or r["block_end"] > r.get("scene_end", 0) + 10)):
+                st.caption(f"📚 Poora dialogue block (transcript): "
+                           f"{r['block_start_hms']} – "
+                           f"{r['block_end_hms']} — transcript is se "
+                           "zyada bareek scene ki sarhad nahi de "
+                           "sakta; upar wala scene range usi block "
+                           "ka muntakhab hissa hai.")
+            _rb = r.get("boundary") or {}
+            if _rb:
+                st.caption("🧭 Sarhadein: "
+                           + ("frames se check ho gayin — "
+                              if _rb.get("kind") == "frame_checked"
+                              else "transcript estimate — ")
+                           + _rb.get("detail", ""))
             if r.get("reasons"):
                 st.write("**Why this matches:**")
                 for reason in r["reasons"]:
@@ -781,6 +808,23 @@ if res is not None:
                                 r["youtube_id"],
                                 r.get("scene_start", r["timestamp"]),
                                 r.get("scene_end", r["timestamp"]))
+                    if st.button("🧭 Sarhadein frames se check karein — "
+                                 "scene waqai yahin shuru aur khatam "
+                                 "hoti hai?", key="bnd_btn"):
+                        with st.spinner("Boundary frames check ho rahe "
+                                        "hain…"):
+                            st.session_state.bnd_res = \
+                                analyze_mod.verify_boundaries(
+                                    r["youtube_id"],
+                                    r.get("scene_start", r["timestamp"]),
+                                    r.get("scene_end", r["timestamp"]))
+                    _bres = st.session_state.get("bnd_res")
+                    if _bres:
+                        st.caption(
+                            ("🧭 Boundary check: frames se consistent "
+                             "— " if _bres.get("kind") == "frame_checked"
+                             else "🧭 Boundary check: ")
+                            + _bres.get("detail", ""))
                     _vres = st.session_state.get("visual_res")
                     if _vres:
                         if _vres.get("available"):
@@ -985,6 +1029,19 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
             st.caption(_VIS_ICON.get(_vstat, "")
                        + (f" — {_vis.get('detail', '')}"
                           if _vis.get("detail") else ""))
+            if r.get("match_start_hms"):
+                st.caption(f"🎯 Clip ka matched hissa: "
+                           f"{r['match_start_hms']} – "
+                           f"{r['match_end_hms']} • Poora scene "
+                           f"(transcript estimate): {s_hms} – {e_hms}")
+            _bnd = r.get("boundary") or {}
+            if _bnd:
+                if _bnd.get("kind") == "frame_checked":
+                    st.caption("🧭 Sarhadein: frames se check ho "
+                               "gayin — " + _bnd.get("detail", ""))
+                else:
+                    st.caption("🧭 Sarhadein: transcript estimate — "
+                               + _bnd.get("detail", ""))
             if r.get("matched_lines"):
                 with st.expander("📜 Matching dialogue (saboot) — "
                                  "episode ki asal lines, timestamps "

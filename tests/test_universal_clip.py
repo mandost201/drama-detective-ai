@@ -71,6 +71,12 @@ def test_urdu_clip_matches_english_captions_via_translate(built_db,
                         lambda *a, **k: {"status": "unavailable",
                                          "best_distance": None,
                                          "detail": "test stub"})
+    monkeypatch.setattr(analyze, "verify_boundaries",
+                        lambda *a, **k: {"kind": "transcript_estimate",
+                                         "status": "unavailable",
+                                         "start_cut": None,
+                                         "end_cut": None,
+                                         "detail": "test stub"})
     res = analyze.analyze_clip_full(
         pid, Path("clip.wav"),
         transcribe_fn=_stub_tf(CLIP_UR_SEGS, CLIP_EN_SEGS))

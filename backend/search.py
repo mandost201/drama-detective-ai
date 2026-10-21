@@ -155,6 +155,30 @@ def playlist_coverage(pid):
             "pct": round(100.0 * searchable / total, 1) if total else 0.0}
 
 
+def scene_block(video_id, anchor_start, gap_threshold=20.0):
+    """The FULL contiguous dialogue block containing the anchor
+    segment: expand while the silence between consecutive caption
+    segments stays <= gap_threshold. No focus trim, no span cap -
+    this is the transcript's own upper bound for "the complete
+    scene". When an episode's dialogue is dense throughout, the
+    block can span most of the episode; that is reported as-is,
+    because it is exactly what the transcript can and cannot
+    separate. Returns (start, end) in seconds."""
+    segs = db.get_segments(video_id)
+    if not segs:
+        return anchor_start, anchor_start
+    idx = min(range(len(segs)),
+              key=lambda i: abs(segs[i]["start"] - anchor_start))
+    lo = idx
+    while lo > 0 and segs[lo]["start"] - segs[lo - 1]["end"] <= gap_threshold:
+        lo -= 1
+    hi = idx
+    while (hi < len(segs) - 1
+           and segs[hi + 1]["start"] - segs[hi]["end"] <= gap_threshold):
+        hi += 1
+    return round(float(segs[lo]["start"]), 1), round(float(segs[hi]["end"]), 1)
+
+
 def scene_range(video_id, anchor_start, terms=None, gap_threshold=20.0,
                 focus_window=90.0, lead=10.0, max_span=300.0):
     """Estimate the scene's (start, end) around the anchor segment.
@@ -379,10 +403,38 @@ def search(pid, query, mode="auto", top_k=8):
     # scene may sit in an episode that could not be checked at all.
     cov = playlist_coverage(pid)
     for r in ranked:
-        rs, re_ = scene_range(r["video_id"], r["timestamp"], _dist)
+        # Primary scene range = the COMPLETE dialogue block around
+        # the match (span-capped) - the scene estimate. The
+        # focus-trimmed window around the distinctive terms is kept
+        # separately as the relevant core; it used to BE the scene
+        # range, which understated real scenes (an 11-second window
+        # for a 90-second scene on the ground-truth fixture).
+        rs, re_ = scene_range(r["video_id"], r["timestamp"], None)
         r["scene_start"], r["scene_end"] = rs, re_
         r["scene_start_hms"] = format_hms(rs)
         r["scene_end_hms"] = format_hms(re_)
+        fs, fe = scene_range(r["video_id"], r["timestamp"], _dist)
+        r["focus_start"], r["focus_end"] = fs, fe
+        r["focus_start_hms"] = format_hms(fs)
+        r["focus_end_hms"] = format_hms(fe)
+        # The complete dialogue block around the match - the
+        # transcript's upper bound for the scene, reported alongside
+        # the focus-trimmed estimate so neither number pretends to
+        # be an exact cut.
+        bs, be = scene_block(r["video_id"], r["timestamp"])
+        r["block_start"], r["block_end"] = bs, be
+        r["block_start_hms"] = format_hms(bs)
+        r["block_end_hms"] = format_hms(be)
+        r["matched_at"] = r["timestamp"]
+        r["matched_at_hms"] = r["timestamp_hms"]
+        # Boundary provenance: a search result's range comes from
+        # the transcript alone unless/until the frame check runs
+        # (the clip finder runs it for its top result; the UI also
+        # offers it on demand). Never label it frame-verified here.
+        r["boundary"] = {
+            "kind": "transcript_estimate",
+            "detail": "Range transcript ke dialogue block se "
+                      "andarza hai — frames se verify nahi hua."}
         r["url_at"] = watch_url_at(r["youtube_id"], rs)
         r["match_type"] = "transcript"
         if cov["pct"] < 50.0 and r["confidence"] == "high":

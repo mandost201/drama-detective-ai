@@ -185,6 +185,18 @@ def _frames_at(video_id, targets, meta=None):
                 "reason": f"Visual check failed: {type(e).__name__}: {e}"}
 
 
+def boundary_frames(video_id, start, end):
+    """Real storyboard frames straddling a scene range's edges:
+    just before the start, just after it, just before the end, and
+    just after it. Comparing across each edge shows whether a
+    visual cut actually happens near the estimated boundary - the
+    only frame evidence a storyboard can honestly offer (its
+    granularity is seconds, not frames). Never raises."""
+    targets = [max(0.0, start - 8.0), start + 2.0,
+               max(start, end - 2.0), end + 8.0]
+    return _frames_at(video_id, targets)
+
+
 def scene_frames(video_id, start, end, max_frames=3):
     """Real frames at the start / middle / end of [start, end].
 
