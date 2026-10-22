@@ -46,42 +46,112 @@ def _run(cmd, timeout=240):
                           timeout=timeout)
 
 
-def _metadata(video_id):
-    """(duration, frame_w, frame_h) from yt-dlp -j storyboard info."""
-    proc = _run([sys.executable, "-m", "yt_dlp", "-j", "--no-warnings",
-                 f"https://www.youtube.com/watch?v={video_id}"], timeout=120)
-    if proc.returncode != 0:
+def _metadata_for(video_id, timeout, extra):
+    """(duration, frame_w, frame_h) from ONE player client's
+    yt-dlp -j storyboard info, or None."""
+    proc = _run([sys.executable, "-m", "yt_dlp", "-j",
+                 "--no-warnings",
+                 f"https://www.youtube.com/watch?v={video_id}"]
+                + list(extra), timeout=timeout)
+    if proc.returncode != 0 or not proc.stdout:
         return None
-    info = json.loads(proc.stdout)
-    sb = None
+    try:
+        info = json.loads(proc.stdout)
+    except Exception:
+        return None
+    duration = info.get("duration")
     for f in info.get("formats", []):
-        if str(f.get("format_id")) == "sb0":
-            sb = f
-            break
-    if not sb:
-        return None
-    return info.get("duration"), sb.get("width"), sb.get("height")
+        if f.get("format_id") == "sb0":
+            return duration, f.get("width"), f.get("height")
+    return None
 
 
-def _download_storyboard(video_id):
-    """Path of the cached .mhtml storyboard, downloading if needed."""
+# Player clients tried for storyboards, in order: (extractor-args,
+# cache tag). Web first (its spec is the canonical one), android
+# second (it keeps working from server IPs the web path is
+# bot-walled on). Different clients return DIFFERENT storyboard
+# specs (frame size, sheet layout, density), so a video's metadata
+# and its sheets must come from the SAME client - mixing a web
+# spec with android sheets made frames unlocatable (measured
+# 2026-10-22: most episodes failed one way or another until the
+# pairing was enforced; afterwards 28/36 fetched cleanly).
+_CLIENTS = [((), ""),
+            (("--extractor-args", "youtube:player_client=android"),
+             "_and")]
+
+# video_id -> the (extra, tag) whose metadata last succeeded, so
+# _download_storyboard fetches the same client's sheets.
+_WINNER = {}
+
+
+def _metadata(video_id, timeout=120):
+    """Storyboard metadata from the first player client that
+    answers; the winner is remembered for _download_storyboard."""
+    for extra, tag in _CLIENTS:
+        meta = _metadata_for(video_id, timeout, extra)
+        if meta:
+            _WINNER[video_id] = (extra, tag)
+            return meta
+    return None
+
+
+def _download_for(video_id, timeout, extra, tag):
+    """Path of the cached .mhtml storyboard for ONE player
+    client, downloading if needed."""
     _SB_DIR.mkdir(parents=True, exist_ok=True)
-    path = _SB_DIR / f"{video_id}.mhtml"
+    path = _SB_DIR / f"{video_id}{tag}.mhtml"
     if path.exists() and path.stat().st_size > 10000:
         return path
     tmp = str(path) + ".part"
-    for extra in ([], ["--extractor-args", "youtube:player_client=android"]):
-        proc = _run([sys.executable, "-m", "yt_dlp", "-f", "sb0",
-                     "--no-warnings", "-o", tmp,
-                     f"https://www.youtube.com/watch?v={video_id}"] + extra)
-        p = Path(tmp)
-        if proc.returncode == 0 and p.exists() and p.stat().st_size > 10000:
-            p.replace(path)
+    proc = _run([sys.executable, "-m", "yt_dlp", "-f", "sb0",
+                 "--no-warnings", "-o", tmp,
+                 f"https://www.youtube.com/watch?v={video_id}"]
+                + list(extra), timeout=timeout)
+    p = Path(tmp)
+    if proc.returncode == 0 and p.exists() and p.stat().st_size > 10000:
+        p.replace(path)
+        return path
+    try:
+        p.unlink()
+    except OSError:
+        pass
+    return None
+
+
+def _download_storyboard(video_id, timeout=240):
+    """Path of the cached .mhtml storyboard, preferring the
+    client whose metadata won for this video (same-client
+    consistency), then any client that yields a file."""
+    order = []
+    if video_id in _WINNER:
+        order.append(_WINNER[video_id])
+    order += [c for c in _CLIENTS if c not in order]
+    for extra, tag in order:
+        path = _download_for(video_id, timeout, extra, tag)
+        if path:
             return path
-        try:
-            p.unlink()
-        except OSError:
-            pass
+    return None
+
+
+def _sheets_for(video_id):
+    """(meta, sheets, ranges) with metadata and sheets fetched
+    consistently from ONE player client, or None when neither
+    client yields a usable, layout-consistent storyboard."""
+    for extra, tag in _CLIENTS:
+        meta = _metadata_for(video_id, 120, extra)
+        if not meta:
+            continue
+        path = _download_for(video_id, 240, extra, tag)
+        if not path:
+            continue
+        sheets, ranges = _parse_sheets(path)
+        if not sheets:
+            continue
+        sheet_w, sheet_h = sheets[0].size
+        if not meta[1] or not meta[2] or sheet_w % meta[1] \
+                or sheet_h % meta[2]:
+            continue
+        return meta, sheets, ranges
     return None
 
 
@@ -120,8 +190,8 @@ def _frames_at(video_id, targets, meta=None):
         meta = meta or _metadata(video_id)
         if not meta:
             return {"available": False, "frames": [],
-                    "reason": "YouTube did not offer storyboard previews "
-                              "for this video."}
+                    "reason": "YouTube did not offer storyboard "
+                              "previews for this video."}
         duration, fw, fh = meta
         mhtml = _download_storyboard(video_id)
         if not mhtml:
@@ -134,9 +204,17 @@ def _frames_at(video_id, targets, meta=None):
                     "reason": "Storyboard file could not be parsed."}
         sheet_w, sheet_h = sheets[0].size
         if not fw or not fh or sheet_w % fw or sheet_h % fh:
-            return {"available": False, "frames": [],
-                    "reason": "Unexpected storyboard layout; frames "
-                              "cannot be located reliably."}
+            # Metadata and sheets came from different player
+            # clients (their storyboard specs differ) - retry
+            # once with strictly paired fetches before giving up.
+            got = _sheets_for(video_id)
+            if not got:
+                return {"available": False, "frames": [],
+                        "reason": "Unexpected storyboard layout; "
+                                  "frames cannot be located "
+                                  "reliably."}
+            (duration, fw, fh), sheets, ranges = got
+            sheet_w, sheet_h = sheets[0].size
         cols, rows = sheet_w // fw, sheet_h // fh
         per_sheet = cols * rows
 
@@ -202,13 +280,8 @@ def scene_frames(video_id, start, end, max_frames=3):
 
     Returns {"available": bool, "reason": str,
              "frames": [{"timestamp", "hms", "path"}]}."""
-    meta = _metadata(video_id)
-    if not meta:
-        return {"available": False, "frames": [],
-                "reason": "YouTube did not offer storyboard previews "
-                          "for this video."}
     targets = [start, (start + end) / 2.0, max(start, end - 1.0)]
-    out = _frames_at(video_id, targets, meta)
+    out = _frames_at(video_id, targets)
     out["frames"] = out["frames"][:max_frames]
     return out
 
@@ -220,11 +293,11 @@ def episode_frames(video_id, count=8):
     user can spot a scene with their own eyes and note its
     approximate time, even when no dialogue is indexed. Same honesty
     rules as scene_frames - real frames only, no recognition claims."""
-    meta = _metadata(video_id)
-    if not meta or not meta[0]:
+    got = _metadata(video_id)
+    if not got or not got[0]:
         return {"available": False, "frames": [],
                 "reason": "YouTube did not offer storyboard previews "
                           "for this video."}
-    duration = meta[0]
+    duration = got[0]
     targets = [duration * (i + 0.5) / count for i in range(count)]
-    return _frames_at(video_id, targets, meta)
+    return _frames_at(video_id, targets, got)
