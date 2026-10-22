@@ -444,11 +444,16 @@ def _rescue_alignment(esc_segs, pairs, clip_dur):
     INDEPENDENT pieces of the clip corroborate one scene.
 
     Verdict discipline is unchanged: a single chunk must meet the
-    normal _alignment_verdict floors; otherwise at least two
+    normal _alignment_verdict floors (plus a mass rule against
+    saturated short-chunk scores); otherwise at least two
     distinct clip segments must independently match the same
-    episode within 120s, with >= 10 matched words in total and the
-    strongest chunk >= 0.35 - and that aggregation is capped at
-    probable. Returns (result, verdict, info) or None."""
+    episode within 120s, with >= 10 matched words in total, the
+    strongest chunk >= 0.35, every aggregated chunk >= 0.30, and
+    >= 2 DISTINCTIVE matched words (words rare across the
+    playlist - generic dramatic vocabulary repeated by several
+    chunks is not corroboration; measured false aggregation
+    2026-10-22) - and that aggregation is capped at probable.
+    Returns (result, verdict, info) or None."""
     from . import normalize as norm_mod
     lat_pairs = [(v, [{"start": s["start"], "end": s["end"],
                        "text": norm_mod.transliterate(s["text"])}
@@ -483,7 +488,39 @@ def _rescue_alignment(esc_segs, pairs, clip_dur):
         for s, v, a in align_against_playlist(text, space_pairs):
             groups.setdefault(v["id"], []).append(
                 {"score": s, "video": v, "a": a, "method": label,
-                 "src": src, "qtext": text})
+                 "src": src, "qtext": text, "space": space})
+    # Corpus frequency per space, for the aggregation gate below:
+    # a matched word that occurs in most episodes' dialogue is
+    # generic dramatic vocabulary (aur / kya / kaha / nahi ...),
+    # not identifying evidence - however many chunks repeat it.
+    # The bar is >= 2 playlist-rare matched words (not more):
+    # within ONE drama the genuine dialogue shares much of its
+    # vocabulary with sibling episodes, and the measured true
+    # Wehshi aggregation carried exactly 2 rare words against the
+    # false Raja aggregation's 0 (2026-10-22).
+    from .align import normalize as _tok
+    _df, _n_eps = {}, max(1, len(pairs))
+    for _space, _space_pairs in (("lat", lat_pairs), ("raw", pairs)):
+        _counts = {}
+        for _v, _segs in _space_pairs:
+            _ep_words = set()
+            for _s in _segs:
+                _ep_words.update(_tok(_s["text"]))
+            for _w in _ep_words:
+                _counts[_w] = _counts.get(_w, 0) + 1
+        _df[_space] = _counts
+
+    def _distinctive_matched(distinct):
+        found = set()
+        cap = max(2, int(0.25 * _n_eps))
+        for c in distinct:
+            space_df = _df.get(c.get("space") or "raw", {})
+            shared = set(_tok(c["qtext"])) & \
+                set(_tok(c["a"].get("matched_text") or ""))
+            for w in shared:
+                if space_df.get(w, 0) <= cap:
+                    found.add(w)
+        return len(found)
     best = None
     for _vid, cands in groups.items():
         cands.sort(key=lambda c: c["a"]["offset"])
@@ -497,7 +534,13 @@ def _rescue_alignment(esc_segs, pairs, clip_dur):
                         c["src"] not in by_src or
                         c["score"] > by_src[c["src"]]["score"]):
                     by_src[c["src"]] = c
-            distinct = list(by_src.values())
+            # Aggregation-eligible chunks only: a chunk scoring
+            # below 0.30 is noise, not corroboration - it must not
+            # lend its matched words to the total (measured
+            # 2026-10-22: a 0.23 chunk's 6 generic words pushed a
+            # wrong-episode aggregation over the line).
+            distinct = [c for c in by_src.values()
+                        if c["score"] >= 0.30]
             total_m = sum(c["a"]["matched_words"] for c in distinct)
             # EVERY chunk gets its own verdict check - the
             # highest-scoring chunk is not always the one that
@@ -505,6 +548,21 @@ def _rescue_alignment(esc_segs, pairs, clip_dur):
             # words at a lower score).
             v_single, single = None, None
             for c in cluster:
+                # A lone SHORT chunk must not pass on a saturated
+                # score: the normal verdict floors assume a long
+                # query, but a 5-word generic phrase ("mad what
+                # are you talking about") matching 5 of its own 5
+                # words scores 0.83 while identifying nothing -
+                # measured live 2026-10-22, when exactly such a
+                # chunk anchored the Wehshi clip ~107s early on a
+                # look-alike hospital scene in the right episode.
+                # A single chunk needs real identifying mass
+                # (>= 8 matched words from a >= 10-word query);
+                # anything less can only be promoted by the
+                # >= 2-distinct-segment aggregation below.
+                if c["a"]["matched_words"] < 8 or \
+                        len(c["qtext"].split()) < 10:
+                    continue
                 v = _alignment_verdict(c["score"],
                                         c["a"]["matched_words"])
                 if v == "verified" or (v and not v_single):
@@ -514,7 +572,8 @@ def _rescue_alignment(esc_segs, pairs, clip_dur):
             if single is None:
                 single = max(cluster, key=lambda c: c["score"])
             agg = (len(distinct) >= 2 and total_m >= 10
-                   and single["score"] >= 0.35)
+                   and single["score"] >= 0.35
+                   and _distinctive_matched(distinct) >= 2)
             if not v_single and not agg:
                 continue
             verdict = v_single or "probable"
@@ -589,6 +648,7 @@ def _rescue_alignment(esc_segs, pairs, clip_dur):
     info = {"queries": len(queries),
             "cluster_chunks": len(cluster),
             "distinct_segments": len(distinct),
+            "distinctive_matched": _distinctive_matched(distinct),
             "cluster_matched_words": sum(
                 c["a"]["matched_words"] for c in distinct),
             **info_extra}
