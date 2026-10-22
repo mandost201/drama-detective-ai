@@ -552,9 +552,11 @@ with st.expander("📋 Playlist inventory — discovered / accessible / "
              f"{db.segment_count(pid):,} segments")
     st.write(f"• Failed / transcript nahi: **{len(_inv_failed)}**")
     for _fv in _inv_failed[:10]:
+        _rsn = _fv.get("transcript_error")
         st.caption(f"— {_fv.get('title', '')} (transcript nahi — "
                    "clip is episode mein ho to match nahi ho sakta "
-                   "jab tak transcribe na ho)")
+                   "jab tak transcribe na ho)"
+                   + (f" — wajah: {_rsn}" if _rsn else ""))
     if len(_inv_failed) > 10:
         st.caption(f"…aur {len(_inv_failed) - 10} aur episodes")
 
@@ -567,11 +569,14 @@ with st.expander("📋 Playlist inventory — discovered / accessible / "
 # real frames from across the episode to spot a scene by eye.
 _missing = [v for v in vids if not v.get("has_transcript")]
 if _missing:
-    st.warning(f"⚠️ {len(_missing)} episode(s) ke captions YouTube par "
-               "nahi hain — ye abhi search nahi ho sakte. Neeche har "
-               "episode ke liye asal tareeqe diye hain (Whisper "
-               "transcription, apni subtitle file, ya frames dekh kar "
-               "scene pehchanna).")
+    st.warning(f"⚠️ {len(_missing)} episode(s) ka transcript abhi "
+               "index nahi — ye abhi dialogue se search nahi ho "
+               "sakti. Har episode ki wajah us ke naam ke saath "
+               "neeche di hai (kahin captions hain hi nahi, kahin "
+               "YouTube ne download roka — dono ka ilaaj mukhtalif "
+               "hai). Neeche har episode ke liye asal tareeqe diye "
+               "hain (Whisper transcription, apni subtitle file, "
+               "ya frames dekh kar scene pehchanna).")
     _tx_job = db.get_job(st.session_state.tx_jid) \
         if st.session_state.get("tx_jid") else None
     _tx_running = bool(_tx_job and _tx_job.get("status") == "running")
@@ -625,6 +630,8 @@ if _missing:
                      f"({len(_missing)})"):
         for v in _missing:
             st.markdown(f"**Episode {v['position']} — {v['title']}**")
+            if v.get("transcript_error"):
+                st.caption(f"❌ Wajah: {v['transcript_error']}")
             if st.button("🎙️ Sirf ye episode transcribe karein",
                          key=f"tx_one_{v['id']}", disabled=_tx_running):
                 st.session_state.tx_jid = ingest.start_transcription_job(
@@ -1115,6 +1122,20 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
                 st.write(f"• Kamzor (loop/formulaic) pass matching "
                          f"se bahar rakhe gaye: "
                          f"{', '.join(_diag['weak_passes'])}")
+            if _diag.get("chunked_attempted"):
+                if _diag.get("chunked_words"):
+                    st.write(f"• Chunked transcription (tukron "
+                             f"mein dobara sunna): "
+                             f"{_diag['chunked_words']} alfaz, "
+                             f"zubanain: "
+                             f"{', '.join(_diag.get('chunked_langs') or []) or '—'}"
+                             f" — sample: "
+                             f"{_diag.get('chunked_sample') or ''}")
+                if _diag.get("chunked_error"):
+                    st.write(f"• ⚠️ Chunked transcription: "
+                             f"{_diag['chunked_error']}")
+            if _diag.get("visual_note"):
+                st.write(f"• {_diag['visual_note']}")
     _results_clip = clip_res.get("results") or []
     if clip_res.get("note") and _results_clip:
         st.warning(clip_res["note"])

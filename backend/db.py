@@ -124,7 +124,13 @@ def init_db():
                 ("transcript_prob", "ALTER TABLE videos ADD COLUMN "
                                     "transcript_prob REAL"),
                 ("transcript_at", "ALTER TABLE videos ADD COLUMN "
-                                  "transcript_at REAL")):
+                                  "transcript_at REAL"),
+                # WHY an episode has no transcript - recorded on
+                # every failed fetch so the UI can say "captions
+                # exist but YouTube blocked the download" instead
+                # of a silent skip (2026-10-22).
+                ("transcript_error", "ALTER TABLE videos ADD COLUMN "
+                                     "transcript_error TEXT")):
             if col not in vcols:
                 con.execute(ddl)
         # backfill source_id for rows created before it existed
@@ -252,20 +258,30 @@ def get_video(vid):
 
 
 def mark_transcript(video_id, has, source=None, lang=None, model=None,
-                    prob=None):
+                    prob=None, error=None):
     """Record whether a video has a usable transcript, and - on
     success - its provenance: source (captions/whisper/subtitle/
     seed/upload), the caption or detected language, the speech
     model that produced it, and the language probability. Marking
     a video transcript-less clears the provenance with it, so stale
-    metadata can never describe a transcript that is not there."""
+    metadata can never describe a transcript that is not there.
+    On failure, `error` records WHY (bot-check, rate limit, no
+    captions exist, download failed) so the miss is explained in
+    the UI instead of silently skipped; success clears it."""
     with get_con() as con:
         if has:
             con.execute(
                 "UPDATE videos SET has_transcript=1, transcript_source=?, "
                 "transcript_lang=?, transcript_model=?, transcript_prob=?, "
-                "transcript_at=? WHERE id=?",
+                "transcript_at=?, transcript_error=NULL WHERE id=?",
                 (source, lang, model, prob, time.time(), video_id))
+        elif error is not None:
+            con.execute(
+                "UPDATE videos SET has_transcript=0, transcript_source=NULL, "
+                "transcript_lang=NULL, transcript_model=NULL, "
+                "transcript_prob=NULL, transcript_at=NULL, "
+                "transcript_error=? WHERE id=?",
+                (error, video_id))
         elif source is not None or lang is not None or model is not None:
             con.execute(
                 "UPDATE videos SET has_transcript=0, transcript_source=NULL, "

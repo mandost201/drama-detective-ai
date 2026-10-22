@@ -14,6 +14,7 @@ from . import search as search_mod
 from .config import MAX_VIDEOS_PER_PLAYLIST, REQUEST_DELAY, TRANSCRIPT_WORKERS
 from .config import WHISPER_MODEL
 from .youtube import fetch_playlist, fetch_transcript, fetch_transcript_meta
+from .youtube import last_failure_reason
 
 
 def _seeded_youtube_ids():
@@ -230,10 +231,16 @@ def run_playlist_job(jid: str, pid: str, url: str):
                     db.mark_transcript(v["id"], True, source="captions",
                                        lang=cap_lang)
                 else:
-                    db.mark_transcript(v["id"], False)
+                    # Never a silent skip: the reason is stored and
+                    # shown per episode in the UI.
+                    db.mark_transcript(
+                        v["id"], False,
+                        error=last_failure_reason(v["youtube_id"]))
             except Exception as e:
                 print(f"[ingest] transcript failed for {v['youtube_id']}: {e}")
-                db.mark_transcript(v["id"], False)
+                db.mark_transcript(v["id"], False,
+                                   error=f"Captions fetch mein "
+                                         f"error: {type(e).__name__}")
             finally:
                 time.sleep(REQUEST_DELAY)
                 done[0] += 1
@@ -241,6 +248,40 @@ def run_playlist_job(jid: str, pid: str, url: str):
 
         with ThreadPoolExecutor(max_workers=TRANSCRIPT_WORKERS) as ex:
             list(ex.map(one, stored))
+
+        # ---- caption retry sweep (serial, after the burst).
+        # The parallel pass fires requests in bursts, which is
+        # exactly what trips YouTube's rate limiter - the unlucky
+        # episodes of a burst fail even though their captions
+        # exist (live analyses lost DIFFERENT episodes per run:
+        # Ep16 once, Ep03+04 another time). One calm serial retry
+        # per failure, after the burst has cooled, recovers most
+        # of them; whatever still fails keeps its recorded reason.
+        failed = [v for v in db.get_videos(pid)
+                  if not v["has_transcript"]]
+        if failed:
+            progress("Captions retry", 0, len(failed))
+            for i, v in enumerate(failed):
+                try:
+                    segs, cap_lang = \
+                        fetch_transcript_meta(v["youtube_id"])
+                    if segs:
+                        db.add_segments(v["id"], segs)
+                        db.mark_transcript(v["id"], True,
+                                           source="captions",
+                                           lang=cap_lang)
+                        print(f"[ingest] caption retry rescued "
+                              f"{v['youtube_id']}")
+                    else:
+                        db.mark_transcript(
+                            v["id"], False,
+                            error=last_failure_reason(
+                                v["youtube_id"]))
+                except Exception as e:
+                    print(f"[ingest] caption retry failed for "
+                          f"{v['youtube_id']}: {e}")
+                finally:
+                    progress("Captions retry", i + 1, len(failed))
 
         # ---- whisper transcription for videos with no captions at all.
         # This is what makes "100% analysis" possible for any playlist,

@@ -234,6 +234,68 @@ def _whisper_transcribe(path, task="transcribe", model_name=None):
         getattr(info, "language_probability", None)
 
 
+def _chunked_transcribe(path, chunk_s=12.0, model_name="small"):
+    """Transcribe a clip in SHORT chunks; (segments, languages).
+
+    A whole-file decode of a long music-under-dialogue clip can
+    fall into fluent confabulation (measured on the live app,
+    2026-10-22: an Urdu clip "heard" as invented English). Short
+    chunks reset the decoder context every chunk and re-run
+    language detection per chunk, so real dialogue - including
+    chunks in the playlist's own script - can survive where the
+    whole-file decode invented text. Segment times are absolute.
+    Chunks that hear nothing contribute nothing; nothing is
+    invented here either. Never raises."""
+    import tempfile
+    import wave
+    sr = 16000
+    try:
+        import av
+        from av.audio.resampler import AudioResampler
+        resampler = AudioResampler(format="s16", layout="mono",
+                                   rate=sr)
+        samples = bytearray()
+        with av.open(str(path)) as container:
+            if not container.streams.audio:
+                return [], []
+            for frame in container.decode(container.streams.audio[0]):
+                for pkt in resampler.resample(frame):
+                    samples.extend(pkt.to_ndarray().tobytes())
+    except Exception:
+        return [], []
+    total_s = len(samples) / 2.0 / sr
+    if total_s < 1.0:
+        return [], []
+    segs_all, langs = [], []
+    n_chunks = int(total_s // chunk_s) + (1 if total_s % chunk_s
+                                          else 0)
+    with tempfile.TemporaryDirectory() as td:
+        for i in range(n_chunks):
+            start_s = i * chunk_s
+            a = int(start_s * sr) * 2
+            b = int(min(total_s, start_s + chunk_s) * sr) * 2
+            if b - a < sr:      # < 0.5s tail is not evidence
+                continue
+            wp = Path(td) / f"chunk{i}.wav"
+            try:
+                with wave.open(str(wp), "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(sr)
+                    w.writeframes(bytes(samples[a:b]))
+                segs, lang, _p = _whisper_transcribe(
+                    wp, model_name=model_name)
+            except Exception:
+                continue
+            if lang and lang not in langs:
+                langs.append(lang)
+            for s0, s1, text in segs:
+                segs_all.append((round(start_s + s0, 1),
+                                 round(start_s + s1, 1), text))
+    segs_all.sort(key=lambda s: s[0])
+    return segs_all, langs
+
+
 def _clip_frames(path, count=3):
     """Extract up to `count` frames from a clip with PyAV (works
     where ffmpeg is unavailable, e.g. Streamlit Cloud). Returns a
@@ -791,7 +853,8 @@ def _visual_only_scan(pid, upload_path, lang, prob, coverage):
 
 
 def analyze_clip_full(pid, upload_path, transcribe_fn=None,
-                      visual_check=True, escalate_fn=None):
+                      visual_check=True, escalate_fn=None,
+                      chunked_fn=None):
     """Universal clip pipeline (any drama, any language):
 
     1. Transcribe the clip in its ORIGINAL language (auto-detected)
@@ -801,8 +864,12 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
        to semantic search with the clip text.
     3. Visually verify the top dialogue candidate against real
        storyboard frames of its source video (separate status).
-    4. A speech-less clip goes to a bounded visual-only scan whose
-       results are labelled hints, never verified matches.
+    4. When whole-clip decodes fail, a chunked transcription
+       rescue (short chunks, per-chunk language detection) gets
+       one attempt through the same alignment gates. Storyboard
+       frame matching alone never names an episode: measured on
+       real clips (2026-10-22) it confidently picked wrong
+       episodes/scenes, so frames verify - they do not guess.
     Unindexed episodes are never pretended to be searched - the
     returned coverage says exactly how many were."""
     tf = transcribe_fn or _whisper_transcribe
@@ -1012,6 +1079,40 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
                         diag["rescue"] = rescue_info
                         diag["rescue_stage"] = "escalated"
 
+    if not results:
+        # CHUNKED TRANSCRIPTION RESCUE - one more transcription
+        # approach before giving up on speech: short chunks with
+        # per-chunk language detection (see _chunked_transcribe
+        # for the measured confabulation this answers). The
+        # combined transcript must pass the SAME gates as every
+        # other rescue (diversity, weak-pass, alignment floors) -
+        # a different decode, never a lower bar.
+        diag["chunked_attempted"] = True
+        try:
+            cfn = chunked_fn or _chunked_transcribe
+            ch_segs, ch_langs = cfn(upload_path)
+        except Exception as _ce:
+            ch_segs, ch_langs = [], []
+            diag["chunked_error"] = \
+                f"{type(_ce).__name__}: {_ce}"[:300]
+        if ch_segs:
+            ch_text = " ".join(t for _, _, t in ch_segs)
+            diag["chunked_words"] = len(ch_text.split())
+            diag["chunked_langs"] = ch_langs
+            diag["chunked_sample"] = ch_text[:160]
+            _div = _diversity(ch_text)
+            if (_div is None or _div >= 0.15) and \
+                    not _pass_is_weak(ch_text):
+                got = _rescue_alignment(ch_segs, pairs, clip_dur)
+                if got:
+                    _r, verdict, rescue_info = got
+                    results = [_r]
+                    diag["rescue"] = rescue_info
+                    diag["rescue_stage"] = "chunked"
+        elif "chunked_error" not in diag:
+            diag["chunked_error"] = \
+                "chunked transcription returned no segments"
+
     if not results:  # semantic fallback with the clip's own words
         for q in (text_en, text_o):
             if len(q.split()) < 12:
@@ -1081,6 +1182,28 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
                 # exact clip - at most it is a probable candidate.
                 verdict = "probable"
                 break
+
+    if not results:
+        # VISUAL MATCHING - measured and deliberately NOT a verdict
+        # channel. Standalone storyboard matching was evaluated on
+        # the real Wehshi clip + playlist (2026-10-22) with two
+        # independent methods - colour/hash descriptors and CLIP
+        # image embeddings. Both produced confident WRONG answers:
+        # a wrong episode passed the anchor bar (hash), and on the
+        # true episode a look-alike hospital scene outscored the
+        # real scene while shuffled-order and foreign-video
+        # controls scored as high as the real clip (CLIP).
+        # Storyboards carry ~1 frame per 10s and drama scenes
+        # repeat the same rooms/actors, so frames cannot honestly
+        # NAME an episode. They still verify dialogue results
+        # (combined-evidence check and boundary frames above, and
+        # the app's per-episode frame browser) - verification,
+        # never guessing.
+        diag["visual_note"] = (
+            "Storyboard (tasveer) matching akelay episode nahi "
+            "chunta: asal clips par is ne ghalat episode/scene "
+            "diye hain (2026-10-22 ki jaanch) - frames sirf "
+            "dialogue result ki tasdeeq ke liye hain.")
 
     _top_real_visual = bool(results) and \
         results[0].get("visual", {}).get("status") in ("similar",

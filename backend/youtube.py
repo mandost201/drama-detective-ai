@@ -206,13 +206,91 @@ def fetch_transcript_meta(video_id: str):
     is the actual track that was used (e.g. 'en', 'ur', 'hi', or a
     probed other language) - provenance the caller records with the
     transcript. The API fallback cannot report a language."""
+    segs, lang, _reason = fetch_transcript_meta_diag(video_id)
+    return segs, lang
+
+
+def fetch_transcript_meta_diag(video_id: str):
+    """Like fetch_transcript_meta, but on failure also returns WHY:
+    (segments, language, None) or (None, None, reason). The reason
+    distinguishes "this video has no captions at all" from "captions
+    exist but YouTube blocked/throttled the download" - the two
+    failures look identical from a bare None, and only the second
+    is worth retrying (2026-10-22: live analyses silently lost
+    different episodes per run to exactly this). Goes through the
+    long-standing _transcript_ytdlp_meta / _transcript_api seams
+    (existing tests patch them); the implementations record their
+    last error per video for classification."""
     segs, lang = _transcript_ytdlp_meta(video_id)
     if segs:
-        return segs, lang
+        return segs, lang, None
     try:
-        return _transcript_api(video_id), None
+        asegs = _transcript_api(video_id)
     except Exception:
-        return None, None
+        asegs = None
+    if asegs:
+        return asegs, None, None
+    return None, None, _classify_fetch_failure(
+        _LAST_YTDLP_ERR.get(video_id), _LAST_API_ERR.get(video_id),
+        video_id)
+
+
+# Last fetch error per video, recorded by the real implementations
+# below - the raw material for failure classification.
+_LAST_YTDLP_ERR = {}
+_LAST_API_ERR = {}
+
+
+def last_failure_reason(video_id: str):
+    """The classified reason the most recent caption fetch for
+    this video failed, or None when no fetch error was recorded
+    (e.g. the fetch path was substituted in tests)."""
+    yerr = _LAST_YTDLP_ERR.get(video_id)
+    aerr = _LAST_API_ERR.get(video_id)
+    if yerr is None and aerr is None:
+        return None
+    return _classify_fetch_failure(yerr, aerr, video_id)
+
+
+def _classify_fetch_failure(ytdlp_err, api_err, video_id):
+    blob = f"{ytdlp_err or ''} {api_err or ''}"
+    if "Sign in to confirm" in blob or "not a bot" in blob:
+        return ("YouTube bot-check: captions mojood hain lekin "
+                "server IP se download roka gaya.")
+    if "429" in blob or "Too Many Requests" in blob:
+        return ("YouTube rate limit (HTTP 429): bohat zyada "
+                "requests par aarzi rok — dobara koshish se aam "
+                "tor par theek ho jata hai.")
+    if "IpBlocked" in blob or "RequestBlocked" in blob:
+        return ("YouTube ne is server ki IP se transcript ki "
+                "request block ki.")
+    if not _has_any_caption_tracks(video_id):
+        return ("Is video par YouTube captions mojood hi nahi — "
+                "Whisper transcription hi wahid rasta hai.")
+    tail = (ytdlp_err or api_err or "").strip()[-140:]
+    if tail:
+        return f"Captions download fail hua ({tail})"
+    return "Captions download fail hua (wajah ghair wazeh)."
+
+
+def _has_any_caption_tracks(video_id):
+    """True when --list-subs shows at least one caption track (any
+    language, manual or automatic) for the video."""
+    try:
+        cmd = YTDLP + ["--skip-download", "--list-subs",
+                       "--no-warnings", "--socket-timeout", "20",
+                       "--extractor-args",
+                       "youtube:player_client=android",
+                       watch_url(video_id)]
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=90)
+        for line in (proc.stdout or "").splitlines():
+            m = _OTHER_LANG_ROW.match(line.strip())
+            if m and m.group(1).lower() != "language":
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _download_subs(video_id, sub_langs, tmp, timeout=180):
@@ -220,23 +298,29 @@ def _download_subs(video_id, sub_langs, tmp, timeout=180):
     goes first: YouTube bot-walls the web player path from server
     IPs ("Sign in to confirm you're not a bot") while the android
     client - the same route download_audio uses - keeps working.
-    Falls back to the default client when android yields nothing."""
+    Falls back to the default client when android yields nothing.
+    Returns (files, last_error_tail): the error tail of the final
+    attempt is kept so a failure can be CLASSIFIED (bot-check vs
+    rate limit vs no tracks) instead of silently dropped."""
     base = YTDLP + ["--skip-download", "--no-warnings",
                     "--write-subs", "--write-auto-subs",
                     "--sub-langs", sub_langs, "--sub-format", "vtt",
                     "--socket-timeout", "20",
                     "-o", str(tmp / "%(id)s.%(ext)s")]
+    last_err = ""
     for extra in (["--extractor-args", "youtube:player_client=android"],
                   []):
         try:
-            subprocess.run(base + extra + [watch_url(video_id)],
-                           capture_output=True, text=True, timeout=timeout)
-        except Exception:
-            pass
+            proc = subprocess.run(base + extra + [watch_url(video_id)],
+                                  capture_output=True, text=True,
+                                  timeout=timeout)
+            last_err = (proc.stderr or proc.stdout or "")[-400:]
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
         files = sorted(tmp.glob("*.vtt"))
         if files:
-            return files
-    return []
+            return files, last_err
+    return [], last_err
 
 
 def _transcript_ytdlp(video_id: str):
@@ -245,17 +329,26 @@ def _transcript_ytdlp(video_id: str):
 
 
 def _transcript_ytdlp_meta(video_id: str):
+    segs, lang, _err = _transcript_ytdlp_diag(video_id)
+    return segs, lang
+
+
+def _transcript_ytdlp_diag(video_id: str):
     """yt-dlp subtitle download with one retry: YouTube answers
     bursts of subtitle requests with HTTP 429 (transient), and a
     single retry after a pause rescues otherwise-good episodes.
-    Returns (segments, track_language) or (None, None)."""
+    Returns (segments, track_language, error_tail) - the error
+    tail is None on success."""
+    err = None
     for attempt in range(2):
-        segs, lang = _transcript_ytdlp_once(video_id)
+        segs, lang, err = _transcript_ytdlp_once(video_id)
         if segs:
-            return segs, lang
+            _LAST_YTDLP_ERR[video_id] = None
+            return segs, lang, None
         if attempt == 0:
             time.sleep(20)
-    return None, None
+    _LAST_YTDLP_ERR[video_id] = err
+    return None, None, err
 
 
 _OTHER_LANG_ROW = re.compile(r"^([a-zA-Z][a-zA-Z-]{1,14})\s{2,}\S")
@@ -289,7 +382,7 @@ def _transcript_ytdlp_once(video_id: str):
         # Pass 1: English / Urdu / Hindi tracks (manual or auto),
         # best language wins. This is the pass that rescues episodes
         # whose only captions are not in English.
-        files = _download_subs(video_id, "en.*,ur.*,hi.*", tmp)
+        files, err = _download_subs(video_id, "en.*,ur.*,hi.*", tmp)
         best = _pick_track(files, video_id)
         if best is not None:
             try:
@@ -298,12 +391,14 @@ def _transcript_ytdlp_once(video_id: str):
             except Exception:
                 segs = None
             if segs:
-                return segs, _track_lang(best.name, video_id)
+                return segs, _track_lang(best.name, video_id), None
         # Pass 2: ONE other language, chosen from the track list -
         # any transcript beats no transcript, without a request storm.
         lang = _probe_other_language(video_id)
         if lang:
-            files = _download_subs(video_id, lang, tmp)
+            files, err2 = _download_subs(video_id, lang, tmp)
+            if err2:
+                err = err2
             best = _pick_track(files, video_id)
             if best is not None:
                 try:
@@ -312,10 +407,10 @@ def _transcript_ytdlp_once(video_id: str):
                 except Exception:
                     segs = None
                 if segs:
-                    return segs, _track_lang(best.name, video_id)
-        return None, None
-    except Exception:
-        return None, None
+                    return segs, _track_lang(best.name, video_id), None
+        return None, None, err
+    except Exception as e:
+        return None, None, f"{type(e).__name__}: {e}"
     finally:
         for f in tmp.glob("*"):
             try:
@@ -329,30 +424,48 @@ def _transcript_ytdlp_once(video_id: str):
 
 
 def _transcript_api(video_id: str):
-    from youtube_transcript_api import YouTubeTranscriptApi
+    segs, _err = _transcript_api_diag(video_id)
+    return segs
+
+
+def _transcript_api_diag(video_id: str):
+    """(segments, error) via youtube-transcript-api; the error
+    names the exception (e.g. IpBlocked) so the failure can be
+    classified instead of swallowed."""
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except Exception as e:
+        _LAST_API_ERR[video_id] = f"{type(e).__name__}: {e}"
+        return None, _LAST_API_ERR[video_id]
     api = YouTubeTranscriptApi()
+    last_err = None
     # try manual english first, then any english auto-generated
+    tr = None
     for langs in (["en"], ["en-US", "en-GB"]):
         try:
             tr = api.fetch(video_id, languages=langs)
             break
-        except Exception:
-            tr = None
-    else:
-        tr = None
+        except Exception as e:
+            last_err = e
     if tr is None:
         # last resort: whatever transcript exists
         try:
             lst = api.list(video_id)
             t = next(iter(lst), None)
             tr = t.fetch() if t else None
-        except Exception:
-            tr = None
+        except Exception as e:
+            last_err = e
     if not tr:
-        return None
+        if last_err is not None:
+            _LAST_API_ERR[video_id] = \
+                f"{type(last_err).__name__}: {last_err}"
+            return None, _LAST_API_ERR[video_id]
+        _LAST_API_ERR[video_id] = "no transcript via API"
+        return None, _LAST_API_ERR[video_id]
     segs = [(s.start, s.start + s.duration, s.text.replace("\n", " ").strip())
             for s in tr if s.text.strip()]
-    return segs or None
+    _LAST_API_ERR[video_id] = None
+    return (segs or None), None
 
 
 def download_audio(video_id: str, out_path):
@@ -361,22 +474,30 @@ def download_audio(video_id: str, out_path):
     from pathlib import Path
     out_path = Path(out_path)
     stem = out_path.with_suffix("")  # yt-dlp adds .%(ext)s itself
-    cmd = YTDLP + ["-f", "ba/b", "-x", "--audio-format", "mp3",
-                   "--no-playlist", "--no-warnings",
-                   "--extractor-args", "youtube:player_client=android",
-                   "-o", str(stem) + ".%(ext)s",
-                   f"https://www.youtube.com/watch?v={video_id}"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     final = stem.with_suffix(".mp3")
-    # clean up any non-mp3 leftovers from -x
-    for p in stem.parent.glob(stem.name + ".*"):
-        if p != final:
-            try:
-                p.unlink()
-            except OSError:
-                pass
-    if not final.exists() or final.stat().st_size < 50000:
-        raise RuntimeError(
-            f"audio download failed for {video_id}: "
-            f"{(proc.stderr or proc.stdout)[-300:]}")
-    return final
+    # Player-client fallbacks: a 403 on one route (the live Ep16
+    # backfill died on a bare "HTTP Error 403" from the android
+    # route) is often route-specific - the media URL each client
+    # receives differs, so another client may succeed.
+    last_err = ""
+    for extra in (["--extractor-args", "youtube:player_client=android"],
+                  ["--extractor-args", "youtube:player_client=ios"],
+                  []):
+        cmd = YTDLP + ["-f", "ba/b", "-x", "--audio-format", "mp3",
+                       "--no-playlist", "--no-warnings",
+                       "-o", str(stem) + ".%(ext)s",
+                       f"https://www.youtube.com/watch?v={video_id}"] + extra
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=900)
+        # clean up any non-mp3 leftovers from -x
+        for p in stem.parent.glob(stem.name + ".*"):
+            if p != final:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+        if final.exists() and final.stat().st_size >= 50000:
+            return final
+        last_err = (proc.stderr or proc.stdout or "")[-300:]
+    raise RuntimeError(
+        f"audio download failed for {video_id}: {last_err}")
