@@ -268,5 +268,5 @@ def test_app_missing_captions_panel_renders(missing_ui_db):
     assert any("transcribe karein" in (l or "") for l in button_labels), \
         button_labels
     warnings = [w.value for w in at.warning]
-    assert any("captions YouTube par" in (w or "") for w in warnings), \
+    assert any("Har episode ki wajah" in (w or "") for w in warnings), \
         warnings
