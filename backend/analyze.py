@@ -912,9 +912,221 @@ def _visual_only_scan(pid, upload_path, lang, prob, coverage):
                      "No verified match in this playlist.")}
 
 
+# ------------------------------------------------------ audio channel
+# A Whisper-independent channel: match the clip's SOUND against
+# each episode's sound (backend/audio_match). Calibration on real
+# data (2026-10-22): an original-audio slice cut from an episode
+# matched itself at score 0.95-0.96 with the offset recovered to
+# ~0.01s, while wrong episodes and a re-scored fan-edit clip
+# peaked at 0.50-0.66. The bar below sits far above everything
+# spurious measured and far below every true match measured.
+AUDIO_MATCH_MIN_SCORE = 0.80
+AUDIO_VERIFIED_SCORE = 0.90
+AUDIO_VERIFIED_MARGIN = 0.10
+
+
+def episode_audio_provider(youtube_id):
+    """Production audio_fn for analyze_clip_full: the episode's
+    audio track, cached under data/audio_cache (repeat searches
+    never re-download). Raw download (no ffmpeg conversion);
+    PyAV decodes it later. Raises on failure - callers count it."""
+    from .config import DATA_DIR
+    from . import youtube as yt_mod
+    d = DATA_DIR / "audio_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    for p in sorted(d.glob(youtube_id + ".*")):
+        if p.suffix != ".npz" and p.stat().st_size >= 50000:
+            return p
+    return yt_mod.download_audio_raw(youtube_id, d / youtube_id)
+
+
+def _audio_feats(youtube_id, audio_fn, upload_path=None):
+    from .config import DATA_DIR
+    from . import audio_match as am
+    if upload_path is not None:
+        return am.audio_features(upload_path)
+    path = audio_fn(youtube_id)
+    if not path:
+        return None
+    return am.audio_features(
+        path, cache_dir=DATA_DIR / "audio_cache" / "feats",
+        cache_key=youtube_id)
+
+
+def _audio_result(video, offset, clip_dur, score, verdict, margin,
+                  checked, failed):
+    start = float(offset)
+    end = start + max(2.0, clip_dur)
+    s_start, s_end = search_mod.scene_range(video["id"], start)
+    b_start, b_end = search_mod.scene_block(video["id"], start)
+    reasons = [
+        f"Clip ki AWAZ is episode ki awaz se mili (audio "
+        f"fingerprint score {score:.2f}) — ye saboot Whisper ke "
+        f"sune hue text par nahi, asal sound par hai.",
+        f"Audio search: {checked} episodes ki awaz check hui"
+        + (f", {failed} ki awaz download nahi ho saki." if failed
+           else "."),
+        f"Dusri sab se qareebi episode se faasla (margin): "
+        f"{margin:.2f}.",
+        "Neeche di gayi lines is waqt par episode ki apni "
+        "captions hain (context) — clip ki awaz un se nahi, "
+        "sound se mili hai.",
+    ]
+    return {
+        "video_id": video["id"], "youtube_id": video["youtube_id"],
+        "title": video["title"], "episode": video["position"],
+        "timestamp": round(start, 1), "timestamp_hms": format_hms(start),
+        "match_start": round(start, 1), "match_end": round(end, 1),
+        "match_start_hms": format_hms(start),
+        "match_end_hms": format_hms(end),
+        "scene_start": round(s_start, 1), "scene_end": round(s_end, 1),
+        "scene_start_hms": format_hms(s_start),
+        "scene_end_hms": format_hms(s_end),
+        "block_start": round(b_start, 1), "block_end": round(b_end, 1),
+        "block_start_hms": format_hms(b_start),
+        "block_end_hms": format_hms(b_end),
+        "boundary": {"kind": "transcript_estimate",
+                     "status": "not_checked",
+                     "start_cut": None, "end_cut": None,
+                     "detail": "Scene range transcript par mabni "
+                               "andaza hai; clip ka waqt audio "
+                               "fingerprint se napaa gaya hai."},
+        "url": video["url"],
+        "url_at": watch_url_at(video["youtube_id"], start),
+        "thumbnail": video.get("thumbnail"),
+        "confidence": "high" if verdict == "verified" else "medium",
+        "verdict": verdict,
+        "score": round(score, 3),
+        "method": "audio fingerprint matching (sound-based)",
+        "reasons": reasons,
+        "matched_lines": search_mod._nearby_lines(video["id"], start),
+        "visual": {"status": "not_checked", "best_distance": None,
+                   "detail": "Sirf top candidate ki frames check "
+                             "hoti hain."},
+    }
+
+
+def _audio_search_stage(pid, upload_path, clip_dur, audio_fn, diag):
+    """Last-resort search that needs NO transcription at all:
+    compare the clip's sound with every playlist episode's sound.
+    Returns a result dict or None; always records what happened
+    in diag['audio_search'] (checked / failed / best score), so a
+    silent skip is impossible. A clip whose sound was replaced by
+    an editor (fan edits with new music) honestly finds nothing -
+    measured on the real Wehshi fan-edit clip (best 0.50, bar
+    0.80) - while original-audio clips match at 0.95+."""
+    from . import audio_match as am
+    try:
+        clip_feats = am.audio_features(upload_path)
+    except Exception as e:
+        diag["audio_search"] = {
+            "error": f"{type(e).__name__}: {e}"[:200]}
+        return None
+    scored, checked, failed = [], 0, 0
+    for v in db.get_videos(pid):
+        try:
+            ep_feats = _audio_feats(v["youtube_id"], audio_fn)
+            if ep_feats is None:
+                failed += 1
+                continue
+            m = am.best_match(ep_feats, clip_feats)
+        except Exception:
+            failed += 1
+            continue
+        if m is None:
+            failed += 1
+            continue
+        checked += 1
+        scored.append((m["score"], v, m))
+    info = {"checked": checked, "failed": failed,
+            "best_score": None, "best_episode": None,
+            "matched": False}
+    if scored:
+        scored.sort(key=lambda t: t[0], reverse=True)
+        info["best_score"] = round(scored[0][0], 3)
+        info["best_episode"] = scored[0][1]["title"]
+    diag["audio_search"] = info
+    if not scored or scored[0][0] < AUDIO_MATCH_MIN_SCORE:
+        return None
+    score, video, m = scored[0]
+    margin = score - (scored[1][0] if len(scored) > 1 else 0.0)
+    verdict = ("verified"
+               if score >= AUDIO_VERIFIED_SCORE
+               and margin >= AUDIO_VERIFIED_MARGIN
+               else "probable")
+    info["matched"] = True
+    info["margin"] = round(margin, 3)
+    return _audio_result(video, m["offset_s"], clip_dur, score,
+                          verdict, margin, checked, failed)
+
+
+def _audio_refine(top, upload_path, audio_fn, diag):
+    """Refine a dialogue result's start time with the clip's
+    sound: if the episode's audio contains a strong fingerprint
+    peak within +/-150 s of the dialogue start, the acoustic
+    offset replaces the caption-based estimate (caption timing
+    can sit a minute off; a same-recording audio peak is good
+    to ~0.1 s in calibration). Weak/absent peaks change
+    nothing - a re-scored fan-edit simply does not refine."""
+    from . import audio_match as am
+    try:
+        clip_feats = am.audio_features(upload_path)
+        ep_feats = _audio_feats(top["youtube_id"], audio_fn)
+        if ep_feats is None:
+            diag["audio_refine"] = {"error": "episode audio n/a"}
+            return
+        start = float(top["match_start"])
+        m = am.best_match(ep_feats, clip_feats,
+                          lo_s=max(0.0, start - 150.0),
+                          hi_s=start + 150.0)
+    except Exception as e:
+        diag["audio_refine"] = {
+            "error": f"{type(e).__name__}: {e}"[:200]}
+        return
+    if m is None or m["score"] < AUDIO_MATCH_MIN_SCORE:
+        diag["audio_refine"] = {
+            "score": None if m is None else round(m["score"], 3),
+            "applied": False}
+        return
+    new = float(m["offset_s"])
+    delta = new - start
+    diag["audio_refine"] = {"score": round(m["score"], 3),
+                            "offset_s": round(new, 2),
+                            "delta_s": round(delta, 2),
+                            "applied": abs(delta) >= 0.5}
+    if abs(delta) < 0.5:
+        return
+    dur = float(top["match_end"]) - start
+    top["match_start"] = round(new, 1)
+    top["match_end"] = round(new + dur, 1)
+    top["timestamp"] = round(new, 1)
+    top["timestamp_hms"] = format_hms(new)
+    top["match_start_hms"] = format_hms(new)
+    top["match_end_hms"] = format_hms(new + dur)
+    s_start, s_end = search_mod.scene_range(top["video_id"], new)
+    b_start, b_end = search_mod.scene_block(top["video_id"], new)
+    top["scene_start"], top["scene_end"] = round(s_start, 1), \
+        round(s_end, 1)
+    top["scene_start_hms"] = format_hms(s_start)
+    top["scene_end_hms"] = format_hms(s_end)
+    top["block_start"], top["block_end"] = round(b_start, 1), \
+        round(b_end, 1)
+    top["block_start_hms"] = format_hms(b_start)
+    top["block_end_hms"] = format_hms(b_end)
+    top["url_at"] = watch_url_at(top["youtube_id"], new)
+    top["matched_lines"] = search_mod._nearby_lines(top["video_id"],
+                                                    new)
+    top["reasons"].append(
+        f"Audio fingerprint ne waqt durust kiya: dialogue wala "
+        f"andaza {format_hms(start)} tha, clip ki awaz episode ki "
+        f"awaz se {format_hms(new)} par mili (score "
+        f"{m['score']:.2f}) — ye waqt awaz se napaa gaya hai, "
+        f"captions se nahi.")
+
+
 def analyze_clip_full(pid, upload_path, transcribe_fn=None,
                       visual_check=True, escalate_fn=None,
-                      chunked_fn=None):
+                      chunked_fn=None, audio_fn=None):
     """Universal clip pipeline (any drama, any language):
 
     1. Transcribe the clip in its ORIGINAL language (auto-detected)
@@ -930,6 +1142,12 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
        frame matching alone never names an episode: measured on
        real clips (2026-10-22) it confidently picked wrong
        episodes/scenes, so frames verify - they do not guess.
+    5. When an audio_fn is supplied, a Whisper-independent audio
+       fingerprint channel runs last: it refines a dialogue
+       result's start time acoustically, and when no text channel
+       found anything it searches every episode's SOUND directly
+       (see _audio_search_stage for the measured bars). Clips
+       whose sound an editor replaced honestly find nothing here.
     Unindexed episodes are never pretended to be searched - the
     returned coverage says exactly how many were."""
     tf = transcribe_fn or _whisper_transcribe
@@ -990,6 +1208,27 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
     if (div_o is not None and div_o < 0.15
             and (div_en is None or div_en < 0.15)):
         diag["clip_duration_s"] = _probe_duration(upload_path)
+        # Even a looped transcript says nothing about the clip's
+        # SOUND: give the audio channel its chance before
+        # declaring the clip unheard.
+        if audio_fn is not None:
+            _ar = _audio_search_stage(
+                pid, upload_path, diag["clip_duration_s"] or 0.0,
+                audio_fn, diag)
+            if _ar is not None:
+                diag["verdict"] = _ar["verdict"]
+                diag["failure_kind"] = "ok"
+                return {"ok": True, "language": lang,
+                        "language_probability": prob,
+                        "clip_transcript": text_o,
+                        "clip_transcript_en": text_en or None,
+                        "results": [_ar], "coverage": coverage,
+                        "verdict": _ar["verdict"],
+                        "failure_kind": "ok",
+                        "diagnostics": diag,
+                        "method": "audio fingerprint matching "
+                                  "(sound-based)",
+                        "note": None}
         diag["verdict"] = "not_verified"
         diag["failure_kind"] = "transcript_degenerate"
         return {"ok": True, "language": lang,
@@ -1243,6 +1482,23 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
                 verdict = "probable"
                 break
 
+    audio_matched = False
+    if not results and audio_fn is not None:
+        # AUDIO FINGERPRINT SEARCH - the last channel needs no
+        # transcription at all (see _audio_search_stage). It
+        # also covers episodes that have no captions: their
+        # sound is searchable even when their text is not.
+        _ar = _audio_search_stage(pid, upload_path, clip_dur,
+                                  audio_fn, diag)
+        if _ar is not None:
+            results = [_ar]
+            verdict = _ar["verdict"]
+            audio_matched = True
+
+    if results and audio_fn is not None and not audio_matched:
+        # Acoustic refinement of the winning dialogue result.
+        _audio_refine(results[0], upload_path, audio_fn, diag)
+
     if not results:
         # VISUAL MATCHING - measured and deliberately NOT a verdict
         # channel. Standalone storyboard matching was evaluated on
@@ -1269,7 +1525,8 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
         results[0].get("visual", {}).get("status") in ("similar",
                                                        "different")
     if results and visual_check and (kept or rescue_info or
-                                     _top_real_visual):
+                                     _top_real_visual or
+                                     audio_matched):
         top = results[0]
         if top.get("visual", {}).get("status") in (None, "not_checked"):
             top["visual"] = _visual_verify(upload_path,
@@ -1306,7 +1563,9 @@ def analyze_clip_full(pid, upload_path, transcribe_fn=None,
             "verdict": verdict or "not_verified",
             "failure_kind": failure_kind,
             "diagnostics": diag,
-            "method": "clip transcription (original + translate) + "
+            "method": "audio fingerprint matching (sound-based)"
+                      if audio_matched else
+                      "clip transcription (original + translate) + "
                       "dialogue alignment",
             "note": None if results else
                     "No verified match in this playlist."}

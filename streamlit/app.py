@@ -1038,7 +1038,8 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
                 return _transcribe_upload_info(path, task=task)
             clip_res = analyze_mod.analyze_clip_full(
                 pid, cpath, transcribe_fn=_tf,
-                escalate_fn=_transcribe_upload_info_small)
+                escalate_fn=_transcribe_upload_info_small,
+                audio_fn=analyze_mod.episode_audio_provider)
     except Exception as e:
         st.error(f"Could not analyze the clip: {e}")
         st.stop()
@@ -1134,6 +1135,39 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
                 if _diag.get("chunked_error"):
                     st.write(f"• ⚠️ Chunked transcription: "
                              f"{_diag['chunked_error']}")
+            _as = _diag.get("audio_search")
+            if _as:
+                if _as.get("error"):
+                    st.write(f"• ⚠️ Audio (awaz) fingerprint "
+                             f"search: {_as['error']}")
+                else:
+                    st.write(f"• Audio (awaz) fingerprint search: "
+                             f"{_as.get('checked', 0)} episodes ki "
+                             f"awaz check hui"
+                             + (f", {_as['failed']} ki awaz nahi "
+                                f"mil saki" if _as.get("failed")
+                                else "")
+                             + (f"; sab se zyada score "
+                                f"{_as['best_score']}"
+                                if _as.get("best_score") is not None
+                                else "")
+                             + (" — match mil gaya."
+                                if _as.get("matched") else
+                                " — koi episode ki awaz hadd "
+                                "(0.80) tak nahi pohanchi."))
+            _ar2 = _diag.get("audio_refine")
+            if _ar2:
+                if _ar2.get("error"):
+                    st.write(f"• ⚠️ Audio se waqt ki durustagi: "
+                             f"{_ar2['error']}")
+                elif _ar2.get("applied"):
+                    st.write(f"• Audio fingerprint ne waqt durust "
+                             f"kiya (score {_ar2.get('score')}, "
+                             f"farq {_ar2.get('delta_s')}s).")
+                else:
+                    st.write(f"• Audio se waqt ki durustagi nahi "
+                             f"hui (score {_ar2.get('score')}) — "
+                             f"dialogue wala waqt hi rakha gaya.")
             if _diag.get("visual_note"):
                 st.write(f"• {_diag['visual_note']}")
     _results_clip = clip_res.get("results") or []

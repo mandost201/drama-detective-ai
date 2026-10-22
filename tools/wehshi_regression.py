@@ -122,6 +122,78 @@ def main():
               f"({r['failure_kind']}) -> {'PASS' if good else 'FAIL'}",
               flush=True)
 
+    # CASE audio (2026-10-22): the sound channel. (a) An
+    # ORIGINAL-audio slice cut from ep36 at the true scene must
+    # be found by sound alone - at ~1986 s, within seconds -
+    # even when the transcript is the live-style English
+    # confabulation. (b) The real fan-edit clip (whose sound an
+    # editor replaced) must NOT be force-matched by sound: the
+    # search runs, reports its best score, and stays honest.
+    ep_audio_dir = CW / "ep_audio"
+    ep36_file = ep_audio_dir / "y0q5xYZ8jZ8.mp4"
+    if ep36_file.exists():
+        import wave as _wave
+        import numpy as _np
+        from backend import audio_match as _am
+        slice_path = CW / "wehshi_ep36_slice_1986.wav"
+        if not slice_path.exists():
+            sig = _am.decode_mono(ep36_file)
+            seg = sig[int(1986 * _am.SR):int(2046 * _am.SR)]
+            pcm = _np.clip(seg * 32767, -32768, 32767) \
+                .astype(_np.int16)
+            with _wave.open(str(slice_path), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(_am.SR)
+                w.writeframes(pcm.tobytes())
+
+        def _audio_prov(yid):
+            p = ep_audio_dir / f"{yid}.mp4"
+            return p if p.exists() else None
+
+        _CONFAB = ("Pihu, you talk about yourself, okay? Now, we "
+                   "will be together, no one can stop us. We will "
+                   "start with a new story. This will be fun, "
+                   "okay? No, Asim. You have made the biggest "
+                   "mistake of your life. That girl used to go "
+                   "away with you and you took her away.")
+
+        def _tf_confab(p, task="transcribe"):
+            return ([(0.0, 5.0, _CONFAB)], "en", 0.9)
+
+        def _run_audio(clip):
+            return analyze.analyze_clip_full(
+                pid, clip, transcribe_fn=_tf_confab,
+                escalate_fn=_tf_confab,
+                chunked_fn=lambda p: ([], []),
+                audio_fn=_audio_prov, visual_check=False)
+
+        r = _run_audio(slice_path)
+        top = r["results"][0] if r["results"] else {}
+        good = (r["verdict"] in ("probable", "verified")
+                and top.get("youtube_id") == TRUTH_VID
+                and abs(top.get("match_start", -9999) - 1986) <= 3)
+        ok &= good
+        print(f"CASE audio-slice->wehshi: {r['verdict']} "
+              f"vid={top.get('youtube_id')} "
+              f"match_start={top.get('match_start')} "
+              f"score={top.get('score')} "
+              f"-> {'PASS' if good else 'FAIL'}", flush=True)
+
+        r = _run_audio(WEHSHI_CLIP)
+        _as = r["diagnostics"].get("audio_search") or {}
+        good = (r["verdict"] == "not_verified"
+                and _as.get("checked", 0) >= 1
+                and (_as.get("best_score") or 0) < 0.80)
+        ok &= good
+        print(f"CASE audio-fanedit->wehshi: {r['verdict']} "
+              f"audio_checked={_as.get('checked')} "
+              f"best_score={_as.get('best_score')} "
+              f"-> {'PASS' if good else 'FAIL'}", flush=True)
+    else:
+        print("CASE audio: SKIP (ep36 audio not downloaded)",
+              flush=True)
+
     db.DB_PATH = gt_db  # cross check runs against the GT DB
     r = run(raja, WEHSHI_CLIP)
     good = r["verdict"] == "not_verified"
