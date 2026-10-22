@@ -501,3 +501,32 @@ def download_audio(video_id: str, out_path):
         last_err = (proc.stderr or proc.stdout or "")[-300:]
     raise RuntimeError(
         f"audio download failed for {video_id}: {last_err}")
+
+
+def download_audio_raw(video_id: str, out_stem):
+    """Download the best audio track WITHOUT conversion (no ffmpeg
+    on Streamlit Cloud): the file lands as .m4a/.webm/.opus next to
+    `out_stem` and is decoded later with PyAV. Same player-client
+    fallbacks as download_audio. Returns the Path; raises
+    RuntimeError on failure."""
+    from pathlib import Path
+    out_stem = Path(out_stem)
+    last_err = ""
+    for extra in (["--extractor-args", "youtube:player_client=android"],
+                  ["--extractor-args", "youtube:player_client=ios"],
+                  []):
+        cmd = YTDLP + ["-f", "ba/b[height<=144]/b",
+                       "--no-playlist", "--no-warnings",
+                       "-o", str(out_stem) + ".%(ext)s",
+                       f"https://www.youtube.com/watch?v={video_id}"] \
+            + extra
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=600)
+        cands = sorted(out_stem.parent.glob(out_stem.name + ".*"),
+                       key=lambda p: p.stat().st_size, reverse=True)
+        for p in cands:
+            if p.stat().st_size >= 50000:
+                return p
+        last_err = (proc.stderr or proc.stdout or "")[-300:]
+    raise RuntimeError(
+        f"raw audio download failed for {video_id}: {last_err}")
